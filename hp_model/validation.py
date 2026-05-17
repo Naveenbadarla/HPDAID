@@ -2,11 +2,13 @@
 validation.py — Sanity checks on optimisation results.
 
 Validation categories:
-    A. Thermal sanity     — temperature inside bounds, no unrealistic ramps
-    B. Energy sanity      — elec = thermal / COP, DHW balance closes
-    C. Optimisation sanity— end-of-horizon not gamed, comfort penalty not abused
-    D. Market sanity      — DA-only vs DA+ID handled correctly; no min(DA,ID) hack
-    E. Business sanity    — savings within plausible range
+    A. Thermal sanity        — temperature inside bounds, no unrealistic ramps
+    B. Energy sanity         — elec = thermal / COP, DHW balance closes
+    C. Optimisation sanity   — end-of-horizon not gamed, comfort penalty not abused
+    D. Market sanity         — DA-only vs DA+ID handled correctly; no min(DA,ID) hack
+    E. Business sanity       — savings within plausible range
+    F. Annualisation sanity  — short / winter-heavy horizons flagged when
+                               extrapolated to a full year
 
 Each check returns a `Finding`; the app renders them as colour-coded
 banners.
@@ -14,11 +16,11 @@ banners.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
-from .scenarios import ScenarioResult
+from .scenarios import ScenarioResult, detect_season, annualisation_factor
 from .archetypes import Archetype
 
 
@@ -56,7 +58,6 @@ def check_thermal(r: ScenarioResult, arch: Archetype) -> List[Finding]:
         out.append(_ok("thermal.bounds", f"Indoor temperature within 10-30 °C "
                                           f"(min {t.min():.1f}, max {t.max():.1f}, mean {t.mean():.1f})."))
 
-    # Unrealistic ramp check: |dT| per step
     ramp = np.diff(t)
     max_ramp = np.max(np.abs(ramp)) if len(ramp) else 0.0
     if max_ramp > 2.5:
@@ -73,7 +74,6 @@ def check_thermal(r: ScenarioResult, arch: Archetype) -> List[Finding]:
 # --------------------------------------------------------------------------
 def check_energy(r: ScenarioResult, arch: Archetype) -> List[Finding]:
     out: List[Finding] = []
-    # elec consistency
     expected_el = r.q_sh_kwh / r.cop_sh + r.q_dhw_kwh / r.cop_dhw
     diff = np.max(np.abs(expected_el - r.elec_kwh))
     if diff > 1e-3:
@@ -82,14 +82,12 @@ def check_energy(r: ScenarioResult, arch: Archetype) -> List[Finding]:
     else:
         out.append(_ok("energy.elec_consistency", "elec = thermal/COP holds for every step."))
 
-    # Capacity check
     q_max = arch.hp_thermal_kw * (r.timestamps[1] - r.timestamps[0]).total_seconds() / 3600.0
     if np.any(r.q_sh_kwh + r.q_dhw_kwh > q_max * 1.01):
         out.append(_err("energy.capacity", "Heat-pump thermal capacity breached."))
     else:
         out.append(_ok("energy.capacity", f"HP thermal output stays within {q_max:.2f} kWh / step."))
 
-    # COP range
     if np.any(r.cop_sh < 1.5) or np.any(r.cop_sh > 6.0):
         out.append(_warn("energy.cop_range", "Space-heating COP outside [1.5, 6.0]."))
     return out
@@ -105,7 +103,6 @@ def check_optimisation(r: ScenarioResult, arch: Archetype) -> List[Finding]:
     else:
         out.append(_ok("opt.status", f"Solver status: {r.status}."))
 
-    # End-of-horizon gaming: terminal indoor temp not far below target
     if len(r.t_in_c) > 0:
         t_end = r.t_in_c[-1]
         if t_end < arch.t_target - 1.5:
@@ -117,7 +114,6 @@ def check_optimisation(r: ScenarioResult, arch: Archetype) -> List[Finding]:
         else:
             out.append(_ok("opt.end_horizon",
                            f"Final indoor temperature {t_end:.1f} °C close to target."))
-    # End-of-horizon DHW
     if len(r.e_dhw_kwh) > 0:
         e_end = r.e_dhw_kwh[-1]
         if e_end < 0.3 * arch.dhw_tank_kwh:
@@ -125,8 +121,6 @@ def check_optimisation(r: ScenarioResult, arch: Archetype) -> List[Finding]:
         else:
             out.append(_ok("opt.end_dhw", f"Final DHW state {e_end:.1f} kWh."))
 
-    # Comfort violations should be near zero (otherwise the optimiser used the
-    # comfort slack as cheap "savings").
     cv_total = float(np.sum(r.comfort_violation_kdeg))
     if cv_total > 1.0:
         out.append(_warn(
@@ -145,7 +139,6 @@ def check_market(r: ScenarioResult) -> List[Finding]:
     out: List[Finding] = []
     if r.name == "S0":
         return out
-    # DA+ID scenarios must have a non-zero ID adjustment (otherwise S2==S1)
     if r.name in ("S2", "S3", "S4"):
         adj = float(np.sum(np.abs(r.id_adjustment_kwh)))
         if adj < 1e-6:
@@ -154,7 +147,6 @@ def check_market(r: ScenarioResult) -> List[Finding]:
             out.append(_ok("market.id_nonzero",
                            f"DA+ID settled correctly with {adj:.1f} kWh of ID adjustment volume."))
 
-    # Cost must equal da_component + id_component (we check up to rounding)
     expected_total = r.da_cost_component_eur + r.id_adjustment_cost_eur
     if abs(expected_total - r.wholesale_cost_eur) > 0.01:
         out.append(_err("market.settlement",
@@ -164,7 +156,7 @@ def check_market(r: ScenarioResult) -> List[Finding]:
 
 
 # --------------------------------------------------------------------------
-# E. Business sanity
+# E. Business sanity (uses simple annualisation for screening only)
 # --------------------------------------------------------------------------
 def check_business(results: Dict[str, ScenarioResult], horizon_days: float) -> List[Finding]:
     out: List[Finding] = []
@@ -194,8 +186,96 @@ def check_business(results: Dict[str, ScenarioResult], horizon_days: float) -> L
         else:
             out.append(_ok(
                 f"biz.save_{k}",
-                f"{k}: {save_pct:.1f}% wholesale saving (€{annual_save:,.0f}/year).",
+                f"{k}: {save_pct:.1f}% horizon-scaled wholesale saving "
+                f"(naive annualisation €{annual_save:,.0f}/year — verify horizon).",
             ))
+    return out
+
+
+# --------------------------------------------------------------------------
+# F. Annualisation / horizon sanity — NEW
+# --------------------------------------------------------------------------
+def check_annualisation(
+    results: Dict[str, ScenarioResult],
+    horizon_days: float,
+    normalisation_mode: str,
+) -> List[Finding]:
+    """Flag short, winter-heavy, or otherwise non-representative horizons.
+
+    Returns findings with codes prefixed `annual.*`. These are the warnings
+    that should be loudly surfaced anywhere a €/year figure is shown.
+    """
+    out: List[Finding] = []
+    if not results:
+        return out
+
+    first = next(iter(results.values()))
+    season = detect_season(first.timestamps, getattr(first, "meta", {}).get("outdoor_temp_c"))
+    factor, note = annualisation_factor(normalisation_mode, horizon_days, season)
+    label = season["season_label"]
+    spans = season["spans_full_year"]
+    winter_heavy = season["winter_heavy"]
+    short = season["is_short_horizon"]
+
+    # 1. Mode disclosure — always shown
+    out.append(_info(
+        "annual.mode",
+        f"Normalisation mode = '{normalisation_mode}', factor ×{factor:.2f}. {note}",
+    ))
+
+    # 2. Horizon length
+    if spans:
+        out.append(_ok(
+            "annual.full_year",
+            f"Horizon is {horizon_days:.0f} days — covers a full year. "
+            "Annualised values are validated.",
+        ))
+    elif short:
+        out.append(_warn(
+            "annual.short_horizon",
+            f"Horizon is only {horizon_days:.1f} days — annualised €/year values are "
+            "extrapolations and may not be representative. "
+            "Run a full year of weather and price data for board-grade estimates.",
+        ))
+    else:
+        out.append(_warn(
+            "annual.medium_horizon",
+            f"Horizon is {horizon_days:.0f} days (< 1 year) — annualised values are "
+            "extrapolations. Verify with a full-year run before external quoting.",
+        ))
+
+    # 3. Winter-heavy bias
+    if winter_heavy:
+        out.append(_warn(
+            "annual.winter_heavy",
+            f"Horizon is winter-heavy ({season['heating_share']*100:.0f}% of timesteps fall in "
+            "heating months). Multiplying winter weeks by 52 OVERSTATES annual savings: "
+            "winter loads are 3–4× the annual average and price volatility is 2–3× higher. "
+            "Treat annualised €/year figures as INDICATIVE UPSIDE, not validated benefit.",
+        ))
+
+    # 4. Recommended board-slide wording
+    if not spans:
+        out.append(_info(
+            "annual.board_wording",
+            "Recommended board-slide caveat: \"Indicative winter-week annualisation only. "
+            "Full-year simulation required before treating this as a customer benefit estimate.\"",
+        ))
+
+    # 5. Hard ceiling: simple-annualised €/year > €600/household is implausible
+    if "S0" in results and len(results) > 1:
+        baseline = results["S0"].wholesale_cost_eur
+        best_cost = min(r.wholesale_cost_eur for k, r in results.items() if k != "S0")
+        annual_value = (baseline - best_cost) * factor
+        # Literature central case is €100-350/yr customer-side, €200-600 wholesale-side
+        if annual_value > 600:
+            out.append(_warn(
+                "annual.implausibly_high",
+                f"Annualised wholesale value €{annual_value:,.0f}/year exceeds typical German "
+                "literature range (€100–600/yr/household). Likely caused by winter-week × 52 "
+                "extrapolation. Re-run with a representative full-year horizon.",
+            ))
+
     return out
 
 
@@ -203,11 +283,16 @@ def check_business(results: Dict[str, ScenarioResult], horizon_days: float) -> L
 # Top-level
 # --------------------------------------------------------------------------
 def run_all_validations(
-    results: Dict[str, ScenarioResult], arch: Archetype, horizon_days: float
+    results: Dict[str, ScenarioResult],
+    arch: Archetype,
+    horizon_days: float,
+    normalisation_mode: str = "simple",
 ) -> Dict[str, List[Finding]]:
     """Run all validation suites; return findings grouped per scenario.
 
-    A special key 'business' contains cross-scenario findings.
+    Special keys:
+        'business'      — cross-scenario findings (% savings, etc.)
+        'annualisation' — horizon / extrapolation flags
     """
     out: Dict[str, List[Finding]] = {}
     for name, r in results.items():
@@ -218,4 +303,5 @@ def run_all_validations(
         findings += check_market(r)
         out[name] = findings
     out["business"] = check_business(results, horizon_days)
+    out["annualisation"] = check_annualisation(results, horizon_days, normalisation_mode)
     return out
