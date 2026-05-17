@@ -457,14 +457,26 @@ with tabs[4]:
         if scen_for_temp:
             sub = {k: results[k] for k in scen_for_temp}
             st.plotly_chart(
-                pl.plot_indoor_temperature(sub, md.outdoor_temp_c, comfort),
+                pl.plot_indoor_temperature(
+                    results=sub,
+                    comfort_band=comfort,
+                    outdoor=md.outdoor_temp_c,
+                    focus=list(sub.keys()),
+                ),
                 use_container_width=True,
             )
 
         st.markdown("#### DHW tank state of charge")
         if scen_for_temp:
+            # DHW tank bounds: lower ≈ 30% SOC, upper = full capacity
+            dhw_full = float(arch.dhw_tank_kwh)
             st.plotly_chart(
-                pl.plot_dhw_tank({k: results[k] for k in scen_for_temp}, float(arch.dhw_tank_kwh)),
+                pl.plot_dhw_tank(
+                    results={k: results[k] for k in scen_for_temp},
+                    e_min=0.3 * dhw_full,
+                    e_max=dhw_full,
+                    focus=list(scen_for_temp),
+                ),
                 use_container_width=True,
             )
 
