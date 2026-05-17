@@ -269,7 +269,7 @@ def _scenario_from_da_id(
         id_adjustment_kwh=settlement.id_adjustment_kwh,
         wholesale_cost_eur=settlement.total_wholesale_cost_eur,
         da_cost_component_eur=settlement.da_cost_eur,
-        id_adjustment_cost_eur=settlement.id_cost_eur,
+        id_adjustment_cost_eur=settlement.id_adjustment_cost_eur,
         retail_cost_eur=retail,
         status=id_res.status,
     )
