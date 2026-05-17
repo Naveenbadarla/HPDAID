@@ -74,11 +74,86 @@ st.sidebar.markdown("---")
 
 with st.sidebar:
     st.subheader("Run window")
-    horizon_days = st.slider("Horizon (days)", 1, 14, 7, 1)
-    timestep_min = st.selectbox("Time step (minutes)", [15, 30, 60], index=0)
+
+    # Horizon presets — preferred way to choose
+    preset = st.selectbox(
+        "Horizon preset",
+        [
+            "1 day (smoke test)",
+            "1 week (winter)",
+            "1 week (summer)",
+            "1 month (winter)",
+            "1 month (summer)",
+            "3 months (heating season)",
+            "Full year (recommended for customer benefit)",
+            "Custom",
+        ],
+        index=6,
+        help=(
+            "A full-year run is the only horizon where the annualised customer-benefit "
+            "number is properly validated. Shorter horizons are useful for debugging or "
+            "scenario testing, but the €/year values they produce are extrapolations."
+        ),
+    )
+
+    # Map preset → (days, start_date)
+    preset_map = {
+        "1 day (smoke test)":                          (1,   pd.Timestamp("2025-01-15")),
+        "1 week (winter)":                             (7,   pd.Timestamp("2025-01-13")),
+        "1 week (summer)":                             (7,   pd.Timestamp("2025-07-14")),
+        "1 month (winter)":                            (31,  pd.Timestamp("2025-01-01")),
+        "1 month (summer)":                            (31,  pd.Timestamp("2025-07-01")),
+        "3 months (heating season)":                   (90,  pd.Timestamp("2025-01-01")),
+        "Full year (recommended for customer benefit)":(365, pd.Timestamp("2025-01-01")),
+    }
+    if preset != "Custom":
+        horizon_days, start_date = preset_map[preset]
+    else:
+        horizon_days = st.slider("Custom horizon (days)", 1, 365, 7, 1)
+        start_date = st.date_input("Start date", value=pd.Timestamp("2025-01-13").date())
+        start_date = pd.Timestamp(start_date)
+
+    # Auto-coarsen timestep for long horizons
+    if horizon_days >= 90:
+        recommended_min = 60
+    elif horizon_days >= 30:
+        recommended_min = 30
+    else:
+        recommended_min = 15
+
+    timestep_min = st.selectbox(
+        "Time step (minutes)",
+        [15, 30, 60],
+        index=[15, 30, 60].index(recommended_min),
+        help=(
+            "Auto-coarsened for long horizons to keep LP solve time manageable. "
+            "15-min is the German MTU; for annual-scale customer benefit a 60-min "
+            "resolution is standard and sufficient."
+        ),
+    )
     timestep_h = timestep_min / 60.0
     n_steps = int(round(horizon_days * 24 / timestep_h))
-    start_date = pd.Timestamp("2025-01-13")  # a winter Monday
+
+    # Estimate solve time and warn
+    # Empirical: HiGHS solves ~5000 vars/s on Streamlit Cloud free tier
+    n_vars_approx = n_steps * 8  # rough: q_sh, q_dhw, elec, t_in, e_dhw, v_pos, v_neg, slacks
+    est_seconds_per_scenario = max(1, n_vars_approx / 5000)
+    est_total = est_seconds_per_scenario * 4  # ~4 LP solves across S1-S4 (S0 is direct)
+    if est_total > 60:
+        st.caption(
+            f"⏱  Estimated solve time: ~{est_total/60:.1f} min for all scenarios "
+            f"({n_steps:,} timesteps × 4 LPs)."
+        )
+    else:
+        st.caption(f"⏱  Estimated solve time: ~{est_total:.0f}s ({n_steps:,} timesteps).")
+
+    # Loud warning if user picks short horizon
+    if horizon_days < 30:
+        st.warning(
+            "⚠️ Short horizon. Annualised €/year values from a run this short are "
+            "extrapolations, not validated customer-benefit numbers. Use the **Full year** "
+            "preset for a quotable result."
+        )
 
     st.subheader("Archetype")
     arch_options = A.archetype_options()
@@ -114,23 +189,43 @@ with st.sidebar:
     )
 
     st.subheader("Annualisation policy")
+    # Smart default: full_year for long horizons, heating_season for winter-month runs,
+    # none for everything else (forces user to think before quoting €/year).
+    if horizon_days >= 360:
+        default_mode = "full_year"
+    elif horizon_days >= 60 and start_date.month in (10, 11, 12, 1, 2, 3):
+        default_mode = "heating_season"
+    else:
+        default_mode = "none"
+
+    mode_options = ["none", "simple", "heating_season", "full_year"]
     normalisation_mode = st.selectbox(
         "How to extrapolate horizon → year",
-        ["none", "simple", "heating_season", "full_year"],
-        index=1,
+        mode_options,
+        index=mode_options.index(default_mode),
         format_func=lambda m: {
-            "none": "None — show horizon only",
-            "simple": "Simple ×(365 / days) — short horizons OVERSTATE",
+            "none": "None — show horizon only (recommended for short runs)",
+            "simple": "Simple ×(365 / days) — DANGER on short winter runs",
             "heating_season": "Heating-season only (×182 / days)",
-            "full_year": "Full-year (only honest if horizon ≥ 360 d)",
+            "full_year": "Full-year (validated only when horizon ≥ 360 d)",
         }[m],
         help=(
-            "A 7-day winter run × 52 dramatically overstates annual savings because "
-            "winter weeks carry 3–4× annual-average heating load and 2–3× the price volatility. "
-            "Use 'None' or 'heating_season' for short horizons. Use 'full_year' only when "
-            "you actually have a year of data."
+            "Default is chosen for you based on horizon: full-year run → full_year; "
+            "winter-month multi-week → heating_season; otherwise → none (no annualisation). "
+            "You can override, but the model warns loudly if you pick a misleading combination."
         ),
     )
+
+    # Block-the-trap warning: simple mode + short winter horizon = the bad case
+    if (normalisation_mode == "simple" and horizon_days < 60
+            and start_date.month in (10, 11, 12, 1, 2, 3)):
+        st.error(
+            "🚫 **Misleading combination.** You picked `simple` annualisation on a short "
+            "winter horizon. This multiplies winter-week values by 52 and OVERSTATES annual "
+            "savings by 2–4×. Switch to `heating_season` or `none`, OR change the preset to "
+            "**Full year**. The Executive Summary will refuse to show €/year headlines until "
+            "you do."
+        )
 
     st.markdown("---")
     run_btn = st.button("▶  Run optimisation", type="primary", use_container_width=True)
@@ -361,9 +456,15 @@ with tabs[2]:
 # Run handler
 # --------------------------------------------------------------------------
 if run_btn:
-    with st.spinner("Loading market data and solving LP for each scenario…"):
-        md = st.session_state["md"]
-        if md is None:
+    # Load or refresh market data with current horizon settings
+    md = st.session_state.get("md")
+    needs_reload = (
+        md is None
+        or len(md.timestamps) != n_steps
+        or pd.Timestamp(md.timestamps[0]) != pd.Timestamp(start_date)
+    )
+    if needs_reload:
+        with st.spinner("Generating market data for the selected horizon…"):
             md = dl.load_market_data(
                 start=start_date,
                 n_steps=n_steps,
@@ -373,65 +474,82 @@ if run_btn:
             )
             st.session_state["md"] = md
 
-        results = sc.run_all_scenarios(
+    # Per-scenario progress bar
+    progress_bar = st.progress(0.0, text="Initialising…")
+    results: dict = {}
+    n_total = max(1, len(selected_scenarios))
+
+    for i, scen in enumerate(selected_scenarios):
+        progress_bar.progress(
+            i / n_total,
+            text=f"Solving scenario {scen} ({i+1}/{n_total}) — "
+                 f"{n_steps:,} timesteps, this can take 30-90 s on full-year runs…",
+        )
+        single = sc.run_all_scenarios(
             arch=arch,
             md=md,
             timestep_h=timestep_h,
             comfort_band=(float(t_min), float(t_max)),
             comfort_band_flex=(float(t_min_flex), float(t_max_flex)),
-            scenarios=selected_scenarios,
+            scenarios=[scen],
         )
+        results.update(single)
 
-        # Detect season once, reuse everywhere
-        season = sc.detect_season(md.timestamps, md.outdoor_temp_c)
-        # Use season's measured horizon length (more accurate than UI input)
-        horizon_days_eff = float(season["horizon_days"]) or float(horizon_days)
+    progress_bar.progress(1.0, text="Post-processing KPIs and validation…")
 
-        kpi_df = sc.kpi_table(
-            results,
-            horizon_days=horizon_days_eff,
-            normalisation_mode=normalisation_mode,
-            season=season,
-        )
-        value = sc.value_stack(
-            results,
-            horizon_days=horizon_days_eff,
-            normalisation_mode=normalisation_mode,
-            season=season,
-        )
-        interp = sc.build_interpretation(
-            results, value,
-            customer_share=float(C.PORTFOLIO_DEFAULTS["customer_share"]),
-            horizon_days=horizon_days_eff,
-            normalisation_mode=normalisation_mode,
-            season=season,
-        )
-        validations = val.run_all_validations(
-            results, arch, horizon_days_eff,
-            normalisation_mode=normalisation_mode,
-        )
+    # Detect season once, reuse everywhere
+    season = sc.detect_season(md.timestamps, md.outdoor_temp_c)
+    horizon_days_eff = float(season["horizon_days"]) or float(horizon_days)
 
-        st.session_state["results"] = results
-        st.session_state["kpi_df"] = kpi_df
-        st.session_state["value"] = value
-        st.session_state["interpretation"] = interp
-        st.session_state["validations"] = validations
-        st.session_state["season"] = season
-        st.session_state["normalisation_mode"] = normalisation_mode
-        st.session_state["run_cfg"] = {
-            "horizon_days": horizon_days_eff,
-            "timestep_h": timestep_h,
-            "n_steps": n_steps,
-            "comfort_band": (float(t_min), float(t_max)),
-            "comfort_band_flex": (float(t_min_flex), float(t_max_flex)),
-            "archetype": arch_name,
-            "scenarios": selected_scenarios,
-            "normalisation_mode": normalisation_mode,
-            "season_label": season["season_label"],
-            "heating_share": round(season["heating_share"], 3),
-            "annualisation_factor": round(value.get("_annualisation_factor", 1.0), 3),
-        }
-    st.success(f"Solved {len(results)} scenario(s).")
+    kpi_df = sc.kpi_table(
+        results,
+        horizon_days=horizon_days_eff,
+        normalisation_mode=normalisation_mode,
+        season=season,
+    )
+    value = sc.value_stack(
+        results,
+        horizon_days=horizon_days_eff,
+        normalisation_mode=normalisation_mode,
+        season=season,
+    )
+    interp = sc.build_interpretation(
+        results, value,
+        customer_share=float(C.PORTFOLIO_DEFAULTS["customer_share"]),
+        horizon_days=horizon_days_eff,
+        normalisation_mode=normalisation_mode,
+        season=season,
+    )
+    validations = val.run_all_validations(
+        results, arch, horizon_days_eff,
+        normalisation_mode=normalisation_mode,
+    )
+
+    st.session_state["results"] = results
+    st.session_state["kpi_df"] = kpi_df
+    st.session_state["value"] = value
+    st.session_state["interpretation"] = interp
+    st.session_state["validations"] = validations
+    st.session_state["season"] = season
+    st.session_state["normalisation_mode"] = normalisation_mode
+    st.session_state["run_cfg"] = {
+        "horizon_days": horizon_days_eff,
+        "timestep_h": timestep_h,
+        "n_steps": n_steps,
+        "comfort_band": (float(t_min), float(t_max)),
+        "comfort_band_flex": (float(t_min_flex), float(t_max_flex)),
+        "archetype": arch_name,
+        "scenarios": selected_scenarios,
+        "normalisation_mode": normalisation_mode,
+        "season_label": season["season_label"],
+        "heating_share": round(season["heating_share"], 3),
+        "annualisation_factor": round(value.get("_annualisation_factor", 1.0), 3),
+    }
+    progress_bar.empty()
+    st.success(
+        f"✅ Solved {len(results)} scenario(s) across {horizon_days_eff:.0f} days "
+        f"({season['season_label']} period)."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -506,25 +624,42 @@ with tabs[0]:
             help=best["label"] if best is not None else None,
         )
 
-        # Annualised metrics
+        # Annualised metrics — BLOCKED if the combination is misleading
+        is_blocked = (
+            mode == "simple"
+            and not season.get("spans_full_year", False)
+            and season.get("winter_heavy", False)
+        )
+
         st.markdown(
             "**📆 Annualised values** &nbsp;"
             f"<span style='color: #888;'>({mode} mode, factor ×{value.get('_annualisation_factor', 1.0):.2f})</span>",
             unsafe_allow_html=True,
         )
-        m1, m2, m3, _ = st.columns(4)
-        m1.metric(
-            "Baseline retail bill",
-            f"€{baseline_retail_year:,.0f}/yr" if np.isfinite(baseline_retail_year) else "—",
-        )
-        m2.metric(
-            "Retail saving",
-            f"€{saving_retail_year:,.0f}/yr" if np.isfinite(saving_retail_year) else "—",
-        )
-        m3.metric(
-            "Wholesale value (E.ON view)",
-            f"€{saving_eur_year:,.0f}/yr" if np.isfinite(saving_eur_year) else "—",
-        )
+        if is_blocked:
+            st.error(
+                "🚫 **Annualised €/year headline metrics are blocked for this run.**\n\n"
+                "You ran `simple` annualisation on a winter-heavy short horizon. The €/year "
+                "numbers produced by this combination overstate annual savings by 2–4×. "
+                "Either:\n"
+                "1. Switch the **Annualisation policy** to `heating_season` or `none`, or\n"
+                "2. Re-run with the **Full year (recommended)** horizon preset.\n\n"
+                "Horizon values above are unaffected and remain visible."
+            )
+        else:
+            m1, m2, m3, _ = st.columns(4)
+            m1.metric(
+                "Baseline retail bill",
+                f"€{baseline_retail_year:,.0f}/yr" if np.isfinite(baseline_retail_year) else "—",
+            )
+            m2.metric(
+                "Retail saving",
+                f"€{saving_retail_year:,.0f}/yr" if np.isfinite(saving_retail_year) else "—",
+            )
+            m3.metric(
+                "Wholesale value (E.ON view)",
+                f"€{saving_eur_year:,.0f}/yr" if np.isfinite(saving_eur_year) else "—",
+            )
 
         st.markdown("### Interpretation")
         st.markdown(interp)
