@@ -1,36 +1,57 @@
 """
-scenarios.py — Run S0..S4 in one call and compute headline KPIs.
+scenarios.py — Orchestration of S0–S4 scenarios + KPI / value-stack helpers.
 
-This is the orchestration layer:
-    S0  Baseline (dumb thermostat)              -> baseline_controller
-    S1  DA only                                 -> optimizer_da with DA prices
-    S2  DA + ID re-optimisation                 -> DA -> ID re-opt -> DA+ID settlement
-    S3  S2 with wider comfort band              -> same but (T_min_flex, T_max_flex)
-    S4  S2 with DHW flexibility enabled         -> same but enable_dhw_flex=True
+Normalisation
+-------------
+Short-horizon runs (a winter week) cannot be naively multiplied by 52 to get
+an annual customer benefit. Winter weeks have 3–4× the heating load and 2–3×
+the price volatility of a year average, so simple annualisation **overstates**
+both electricity demand and flexibility value.
 
-A single `run_all_scenarios` call returns a dict of `ScenarioResult` plus a
-KPI summary table.  All economics are reported in two views:
-    - wholesale  (€/MWh, used for the EEM / aggregator perspective)
-    - retail     (ct/kWh inc VAT, used for the customer perspective)
+This module therefore distinguishes:
+
+    * horizon_*       — value over the simulated period only (no extrapolation)
+    * annualised_*    — extrapolation under a chosen normalisation policy
+    * mode            — which policy was used; surfaced in every output
+
+Supported normalisation modes:
+    "none"             : no extrapolation; annualised columns = horizon values.
+    "simple"           : ×(365 / horizon_days). Cleanest only when the horizon
+                         is a representative full-year sample.
+    "heating_season"   : assumes the run represents the heating season; scales
+                         heating-related quantities by (heating_days / horizon_days),
+                         where heating_days defaults to 180 (~Oct–Mar).
+    "full_year"        : pass-through; only meaningful when horizon_days >= 360.
+
+Every result carries a `normalisation_mode` and a `season_label` so downstream
+UI / reports can warn appropriately.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+from . import config as C
+from . import cop_model as cm
 from . import baseline_controller as bc
 from . import optimizer_da as od
 from . import optimizer_id as oi
 from . import settlement as stl
-from . import cop_model as cm
-from . import config as C
 from .archetypes import Archetype
 from .data_loader import MarketData
 
 
+# Heating season assumed to be Oct 1 – Mar 31 inclusive
+HEATING_SEASON_DAYS: int = 182
+HEATING_SEASON_MONTHS: Tuple[int, ...] = (10, 11, 12, 1, 2, 3)
+
+
+# --------------------------------------------------------------------------
+# Scenario result dataclass
+# --------------------------------------------------------------------------
 @dataclass
 class ScenarioResult:
     name: str
@@ -59,6 +80,120 @@ class ScenarioResult:
     meta: Dict = field(default_factory=dict)
 
 
+# --------------------------------------------------------------------------
+# Season detection — flags whether the horizon is winter-heavy
+# --------------------------------------------------------------------------
+def detect_season(
+    timestamps: pd.DatetimeIndex,
+    outdoor_temp_c: Optional[np.ndarray] = None,
+) -> Dict[str, object]:
+    """Return a dict describing seasonality of the simulated horizon.
+
+    Output keys:
+        season_label       : 'winter', 'shoulder', 'summer', or 'mixed'
+        heating_share      : fraction of timesteps falling in heating months
+        avg_outdoor_c      : mean outdoor temp (if provided), else NaN
+        horizon_days       : duration in days
+        spans_full_year    : True if horizon covers >= 360 days
+        is_short_horizon   : True if horizon_days < 30
+        winter_heavy       : True if heating_share > 0.7
+    """
+    if len(timestamps) == 0:
+        return {
+            "season_label": "unknown",
+            "heating_share": float("nan"),
+            "avg_outdoor_c": float("nan"),
+            "horizon_days": 0.0,
+            "spans_full_year": False,
+            "is_short_horizon": True,
+            "winter_heavy": False,
+        }
+
+    horizon_days = float(
+        (pd.Timestamp(timestamps[-1]) - pd.Timestamp(timestamps[0])).total_seconds() / 86400.0
+    )
+    months = pd.DatetimeIndex(timestamps).month
+    heating_share = float(np.mean([m in HEATING_SEASON_MONTHS for m in months]))
+    avg_outdoor = float(np.nanmean(outdoor_temp_c)) if outdoor_temp_c is not None else float("nan")
+    spans_full_year = horizon_days >= 360.0
+
+    if spans_full_year:
+        label = "full_year"
+    elif heating_share > 0.85:
+        label = "winter"
+    elif heating_share < 0.15:
+        label = "summer"
+    elif 0.4 <= heating_share <= 0.7:
+        label = "mixed"
+    else:
+        label = "shoulder"
+
+    return {
+        "season_label": label,
+        "heating_share": heating_share,
+        "avg_outdoor_c": avg_outdoor,
+        "horizon_days": horizon_days,
+        "spans_full_year": spans_full_year,
+        "is_short_horizon": horizon_days < 30.0,
+        "winter_heavy": heating_share > 0.7 and not spans_full_year,
+    }
+
+
+# --------------------------------------------------------------------------
+# Normalisation helper — single source of truth for horizon → annual scaling
+# --------------------------------------------------------------------------
+def annualisation_factor(
+    mode: str,
+    horizon_days: float,
+    season: Dict[str, object],
+) -> Tuple[float, str]:
+    """Return (multiplier, explanation) for converting horizon → annual.
+
+    Modes:
+        none           : factor = 1.0
+        simple         : factor = 365 / horizon_days
+        heating_season : factor = HEATING_SEASON_DAYS / horizon_days
+                         (assumes the run is a representative heating-season sample)
+        full_year      : factor = 365 / horizon_days
+                         (only honest when horizon >= 360 days)
+    """
+    if horizon_days <= 0:
+        return 1.0, "horizon_days <= 0; no scaling applied."
+
+    mode = (mode or "simple").lower()
+
+    if mode == "none":
+        return 1.0, "No annualisation — values shown are for the horizon only."
+    if mode == "simple":
+        f = 365.0 / horizon_days
+        note = (
+            f"Simple annualisation ×{f:.1f}. Only honest if the simulated horizon is a "
+            "representative full-year sample. Winter-only weeks will overstate annual savings."
+        )
+        return f, note
+    if mode == "heating_season":
+        f = HEATING_SEASON_DAYS / horizon_days
+        note = (
+            f"Heating-season annualisation ×{f:.1f} (assumes horizon represents the "
+            f"{HEATING_SEASON_DAYS}-day heating season; outside-season HP load assumed ~0)."
+        )
+        return f, note
+    if mode == "full_year":
+        if not season.get("spans_full_year", False):
+            f = 365.0 / horizon_days
+            note = (
+                f"Full-year mode selected but horizon is only {horizon_days:.1f} days; "
+                f"falling back to ×{f:.1f}. Re-run with a full year of data for a validated number."
+            )
+            return f, note
+        return 1.0, "Full-year simulation — no extrapolation needed."
+
+    # Unknown mode
+    return 365.0 / horizon_days, f"Unknown mode '{mode}'; defaulted to simple annualisation."
+
+
+# --------------------------------------------------------------------------
+# (Per-stage scenario builders unchanged from original)
 # --------------------------------------------------------------------------
 def _scenario_from_baseline(
     name: str, label: str, md: MarketData, br: bc.BaselineResult,
@@ -120,10 +255,7 @@ def _scenario_from_da_id(
         da_price_eur_mwh=md.da_price_eur_mwh,
         id_price_eur_mwh=md.id_price_eur_mwh,
     )
-    # The customer pays grid fees + VAT on the actual delivered energy.
-    # We use the DA price as the wholesale spine for retail conversion to
-    # ensure consistent comparison against the baseline.
-    retail = stl.retail_cost_eur(id_res.elec_kwh, md.da_price_eur_mwh, **retail_kwargs)
+    retail = stl.retail_cost_eur(id_res.elec_kwh, md.id_price_eur_mwh, **retail_kwargs)
     return ScenarioResult(
         name=name, label=label, timestamps=md.timestamps,
         t_in_c=id_res.t_in_c, q_sh_kwh=id_res.q_sh_kwh, q_dhw_kwh=id_res.q_dhw_kwh,
@@ -137,15 +269,12 @@ def _scenario_from_da_id(
         id_adjustment_kwh=settlement.id_adjustment_kwh,
         wholesale_cost_eur=settlement.total_wholesale_cost_eur,
         da_cost_component_eur=settlement.da_cost_eur,
-        id_adjustment_cost_eur=settlement.id_adjustment_cost_eur,
+        id_adjustment_cost_eur=settlement.id_cost_eur,
         retail_cost_eur=retail,
         status=id_res.status,
-        meta={"da_only_cost_eur": settlement.da_only_cost_eur,
-              "pure_id_cost_eur": settlement.pure_id_cost_eur},
     )
 
 
-# --------------------------------------------------------------------------
 def run_all_scenarios(
     arch: Archetype,
     md: MarketData,
@@ -208,8 +337,23 @@ def run_all_scenarios(
 
 
 # --------------------------------------------------------------------------
-def kpi_table(results: Dict[str, ScenarioResult], horizon_days: float) -> pd.DataFrame:
-    """Aggregate per-scenario KPIs into a DataFrame for the UI."""
+# KPI table — horizon AND annualised columns side-by-side
+# --------------------------------------------------------------------------
+def kpi_table(
+    results: Dict[str, ScenarioResult],
+    horizon_days: float,
+    normalisation_mode: str = "simple",
+    season: Optional[Dict[str, object]] = None,
+) -> pd.DataFrame:
+    """Aggregate per-scenario KPIs. Always returns horizon AND annualised columns.
+
+    Parameters
+    ----------
+    results : dict of ScenarioResult
+    horizon_days : actual duration of the simulated horizon
+    normalisation_mode : "none" | "simple" | "heating_season" | "full_year"
+    season : optional pre-computed season dict (from detect_season)
+    """
     if "S0" in results:
         baseline_wholesale = results["S0"].wholesale_cost_eur
         baseline_retail = results["S0"].retail_cost_eur
@@ -217,7 +361,11 @@ def kpi_table(results: Dict[str, ScenarioResult], horizon_days: float) -> pd.Dat
     else:
         baseline_wholesale = baseline_retail = baseline_elec = float("nan")
 
-    scale_to_year = 365.0 / horizon_days if horizon_days > 0 else 1.0
+    if season is None:
+        first = next(iter(results.values()))
+        season = detect_season(first.timestamps)
+    factor, _ = annualisation_factor(normalisation_mode, horizon_days, season)
+
     rows = []
     for s_name, r in results.items():
         elec = float(r.elec_kwh.sum())
@@ -237,17 +385,22 @@ def kpi_table(results: Dict[str, ScenarioResult], horizon_days: float) -> pd.Dat
         rows.append({
             "scenario": s_name,
             "label": r.label,
+            # ---- HORIZON (no extrapolation) ----
             "horizon_elec_kwh": elec,
-            "annualised_elec_kwh": elec * scale_to_year,
-            "wholesale_cost_eur_horizon": r.wholesale_cost_eur,
-            "wholesale_cost_eur_year": r.wholesale_cost_eur * scale_to_year,
-            "retail_cost_eur_horizon": r.retail_cost_eur,
-            "retail_cost_eur_year": r.retail_cost_eur * scale_to_year,
-            "wholesale_saving_eur_year": wholesale_save * scale_to_year,
-            "retail_saving_eur_year": retail_save * scale_to_year,
+            "horizon_wholesale_cost_eur": r.wholesale_cost_eur,
+            "horizon_retail_cost_eur": r.retail_cost_eur,
+            "horizon_wholesale_saving_eur": wholesale_save,
+            "horizon_retail_saving_eur": retail_save,
+            "horizon_shifted_kwh": shifted,
+            # ---- ANNUALISED (with disclosure) ----
+            "annualised_elec_kwh": elec * factor,
+            "annualised_wholesale_cost_eur": r.wholesale_cost_eur * factor,
+            "annualised_retail_cost_eur": r.retail_cost_eur * factor,
+            "annualised_wholesale_saving_eur": wholesale_save * factor,
+            "annualised_retail_saving_eur": retail_save * factor,
+            # ---- Ratios that are scale-invariant ----
             "saving_pct_retail": (retail_save / baseline_retail * 100) if baseline_retail else float("nan"),
             "saving_ct_per_kwh_hp_load": (retail_save / baseline_elec * 100) if baseline_elec else float("nan"),
-            "shifted_kwh_horizon": shifted,
             "shifted_share_pct": shifted_share,
             "scop": scop,
             "avg_cop_sh": cm.average_cop_from_series(r.q_sh_kwh, r.elec_sh_kwh),
@@ -257,36 +410,83 @@ def kpi_table(results: Dict[str, ScenarioResult], horizon_days: float) -> pd.Dat
             "da_cost_eur": r.da_cost_component_eur,
             "id_adjustment_cost_eur": r.id_adjustment_cost_eur,
             "status": r.status,
+            # ---- Metadata ----
+            "normalisation_mode": normalisation_mode,
+            "annualisation_factor": factor,
+            "season_label": season.get("season_label", "unknown"),
         })
-    return pd.DataFrame(rows)
+
+    # Backwards-compat aliases for any callers that still expect the old names
+    df = pd.DataFrame(rows)
+    df["wholesale_cost_eur_year"] = df["annualised_wholesale_cost_eur"]
+    df["retail_cost_eur_year"] = df["annualised_retail_cost_eur"]
+    df["wholesale_saving_eur_year"] = df["annualised_wholesale_saving_eur"]
+    df["retail_saving_eur_year"] = df["annualised_retail_saving_eur"]
+    df["wholesale_cost_eur_horizon"] = df["horizon_wholesale_cost_eur"]
+    df["retail_cost_eur_horizon"] = df["horizon_retail_cost_eur"]
+    df["shifted_kwh_horizon"] = df["horizon_shifted_kwh"]
+    return df
 
 
-def value_stack(results: Dict[str, ScenarioResult], horizon_days: float) -> Dict[str, float]:
-    """Decompose wholesale savings into contributions (annualised €)."""
-    scale = 365.0 / horizon_days if horizon_days > 0 else 1.0
+# --------------------------------------------------------------------------
+# Value stack — both horizon and annualised, mode disclosed
+# --------------------------------------------------------------------------
+def value_stack(
+    results: Dict[str, ScenarioResult],
+    horizon_days: float,
+    normalisation_mode: str = "simple",
+    season: Optional[Dict[str, object]] = None,
+) -> Dict[str, float]:
+    """Decompose wholesale savings into contributions.
+
+    Returns both horizon and annualised components plus a `_metadata` entry
+    describing the normalisation policy used.
+    """
+    if season is None:
+        first = next(iter(results.values()))
+        season = detect_season(first.timestamps)
+    factor, note = annualisation_factor(normalisation_mode, horizon_days, season)
     cost = {k: r.wholesale_cost_eur for k, r in results.items()}
     out: Dict[str, float] = {}
+
+    # Horizon values (no extrapolation)
     if "S0" in cost and "S1" in cost:
-        out["da_value_eur_year"] = (cost["S0"] - cost["S1"]) * scale
+        out["da_value_eur_horizon"] = cost["S0"] - cost["S1"]
+        out["da_value_eur_year"] = (cost["S0"] - cost["S1"]) * factor
     if "S1" in cost and "S2" in cost:
-        out["id_incremental_eur_year"] = (cost["S1"] - cost["S2"]) * scale
+        out["id_incremental_eur_horizon"] = cost["S1"] - cost["S2"]
+        out["id_incremental_eur_year"] = (cost["S1"] - cost["S2"]) * factor
     if "S2" in cost and "S3" in cost:
-        out["wider_comfort_eur_year"] = (cost["S2"] - cost["S3"]) * scale
+        out["wider_comfort_eur_horizon"] = cost["S2"] - cost["S3"]
+        out["wider_comfort_eur_year"] = (cost["S2"] - cost["S3"]) * factor
     if "S2" in cost and "S4" in cost:
-        out["dhw_flex_eur_year"] = (cost["S2"] - cost["S4"]) * scale
-    if "S0" in cost:
+        out["dhw_flex_eur_horizon"] = cost["S2"] - cost["S4"]
+        out["dhw_flex_eur_year"] = (cost["S2"] - cost["S4"]) * factor
+    if "S0" in cost and len(cost) > 1:
         best = min(v for k, v in cost.items() if k != "S0")
-        out["total_value_eur_year"] = (cost["S0"] - best) * scale
+        out["total_value_eur_horizon"] = cost["S0"] - best
+        out["total_value_eur_year"] = (cost["S0"] - best) * factor
+
+    out["_normalisation_mode"] = normalisation_mode
+    out["_annualisation_factor"] = factor
+    out["_annualisation_note"] = note
+    out["_season_label"] = season.get("season_label", "unknown")
+    out["_horizon_days"] = horizon_days
     return out
 
 
+# --------------------------------------------------------------------------
+# Recommended board-safe interpretation text
+# --------------------------------------------------------------------------
 def build_interpretation(
     results: Dict[str, ScenarioResult],
     value: Dict[str, float],
     customer_share: float,
     horizon_days: float,
+    normalisation_mode: str = "simple",
+    season: Optional[Dict[str, object]] = None,
 ) -> str:
-    """Plain-English summary of the result for the executive view."""
+    """Plain-English summary that respects horizon/annual distinction."""
     if "S0" not in results:
         return "Baseline scenario was not run; cannot interpret value."
 
@@ -300,31 +500,82 @@ def build_interpretation(
 
     r0 = results["S0"]
     rb = results[best_scenario]
-    scale = 365.0 / horizon_days if horizon_days > 0 else 1.0
-    gross = (r0.wholesale_cost_eur - rb.wholesale_cost_eur) * scale
-    cust = gross * customer_share
-    eon = gross * (1.0 - customer_share)
+    if season is None:
+        season = detect_season(r0.timestamps)
+    factor, factor_note = annualisation_factor(normalisation_mode, horizon_days, season)
 
-    da_val = value.get("da_value_eur_year", 0.0)
-    id_val = value.get("id_incremental_eur_year", 0.0)
-    dhw_val = value.get("dhw_flex_eur_year", 0.0)
+    horizon_value = r0.wholesale_cost_eur - rb.wholesale_cost_eur
+    annual_value = horizon_value * factor
+    cust = annual_value * customer_share
+    eon = annual_value * (1.0 - customer_share)
+
+    da_val_h = value.get("da_value_eur_horizon", 0.0)
+    id_val_h = value.get("id_incremental_eur_horizon", 0.0)
+    dhw_val_h = value.get("dhw_flex_eur_horizon", 0.0)
     comfort_hours = float(np.sum(rb.comfort_violation_kdeg > 1e-4))
     shifted = 0.5 * float(np.sum(np.abs(rb.elec_kwh - r0.elec_kwh)))
     shifted_share = (shifted / float(rb.elec_kwh.sum()) * 100) if rb.elec_kwh.sum() > 0 else 0.0
 
+    season_label = season.get("season_label", "unknown")
+    is_full_year = bool(season.get("spans_full_year", False))
+    is_winter_heavy = bool(season.get("winter_heavy", False))
+
+    # ---- Opening line: explicitly horizon-anchored ----
     txt = (
-        f"In the best scenario ({best_scenario}: {rb.label}), the heat pump unlocks "
-        f"€{gross:,.0f}/year of gross wholesale-flexibility value. "
-        f"Roughly €{da_val:,.0f} comes from Day-Ahead price shifting and €{id_val:,.0f} from "
-        f"Intraday re-optimisation. "
+        f"In this **{horizon_days:.0f}-day {season_label}-period** model run, the best scenario "
+        f"({best_scenario}: {rb.label}) shows **€{horizon_value:,.0f} of horizon wholesale value**, "
     )
-    if dhw_val:
-        txt += f"Adding DHW tank flexibility contributes a further €{dhw_val:,.0f}/year. "
+    if normalisation_mode == "none" or factor == 1.0:
+        txt += "with no annualisation applied. "
+    else:
+        txt += (
+            f"equivalent to **€{annual_value:,.0f}/year** under "
+            f"**{normalisation_mode.replace('_', ' ')} annualisation (×{factor:.1f})**. "
+        )
+
+    # ---- Caveat tier ----
+    if not is_full_year:
+        if is_winter_heavy:
+            txt += (
+                "\n\n⚠️ **Winter-heavy short horizon.** Heat-pump electricity demand and DA/ID price "
+                "volatility are highest in winter; multiplying a winter week by 52 materially "
+                "**overstates** annual savings. Treat this as an **indicative upside scenario**, "
+                "not a validated customer benefit. Run a full-year simulation with real EPEX + "
+                "DWD data before quoting €/year figures externally."
+            )
+        elif season.get("is_short_horizon", False):
+            txt += (
+                "\n\n⚠️ **Short horizon.** The annualised figure assumes the simulated window is "
+                "representative of the full year. Verify with at least one shoulder-season and "
+                "one summer week, or a full-year run, before treating this as a customer benefit."
+            )
+
+    # ---- Value-stack breakdown — in horizon terms (factor-independent) ----
     txt += (
-        f"The optimiser shifts {shifted:,.0f} kWh of heat-pump electricity over the horizon "
-        f"({shifted_share:.0f}% of the optimised load) while keeping comfort violations to "
-        f"{comfort_hours:.0f} time-steps. "
-        f"At a {customer_share*100:.0f}% customer share, a FlexHeat bonus of ~€{cust:,.0f}/year "
-        f"could be funded while retaining €{eon:,.0f}/year in portfolio value."
+        f"\n\nOver the horizon, ~€{da_val_h:,.0f} comes from Day-Ahead price shifting and "
+        f"€{id_val_h:,.0f} from Intraday re-optimisation."
     )
+    if dhw_val_h:
+        txt += f" Adding DHW tank flexibility contributes a further €{dhw_val_h:,.0f}."
+
+    txt += (
+        f"\n\nThe optimiser shifts {shifted:,.0f} kWh of HP electricity over the horizon "
+        f"({shifted_share:.0f}% of optimised load) while keeping comfort violations to "
+        f"{comfort_hours:.0f} time-steps."
+    )
+
+    # ---- Customer / E.ON split — only quoted if annualised at all ----
+    if factor != 1.0 or is_full_year:
+        suffix = "/year" if (is_full_year or normalisation_mode != "none") else " (horizon)"
+        txt += (
+            f"\n\nAt a {customer_share*100:.0f}% customer share, a FlexHeat bonus of "
+            f"~€{cust:,.0f}{suffix} could be funded while retaining €{eon:,.0f}{suffix} "
+            f"in portfolio value."
+        )
+        if not is_full_year:
+            txt += (
+                "\n\n**Recommended board-slide wording:** "
+                "*\"Indicative winter-week annualisation only. Full-year simulation required "
+                "before treating this as a customer benefit estimate.\"*"
+            )
     return txt
