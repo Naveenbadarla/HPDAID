@@ -484,20 +484,24 @@ with tabs[4]:
         day_choice = st.selectbox(
             "Day to inspect", list(range(1, int(horizon_days) + 1)), index=0, key="day_pick"
         )
-        steps_per_day = int(round(24 / timestep_h))
-        i0 = (int(day_choice) - 1) * steps_per_day
-        i1 = i0 + steps_per_day
         scen_for_dispatch = st.selectbox(
             "Scenario", list(results.keys()),
             index=min(2, len(results) - 1),
             key="dispatch_scen",
         )
+        # Day timestamp from the market data index
+        day_ts = pd.Timestamp(md.timestamps[0]).normalize() + pd.Timedelta(days=int(day_choice) - 1)
+        dhw_full = float(arch.dhw_tank_kwh)
         st.plotly_chart(
             pl.plot_daily_dispatch(
-                results[scen_for_dispatch],
-                md.da_price_eur_mwh,
-                md.id_price_eur_mwh,
-                start_idx=i0, end_idx=i1,
+                md_ts=md.timestamps,
+                da=md.da_price_eur_mwh,
+                idp=md.id_price_eur_mwh,
+                result=results[scen_for_dispatch],
+                day=day_ts,
+                e_min=0.3 * dhw_full,
+                e_max=dhw_full,
+                comfort_band=(float(t_min), float(t_max)),
             ),
             use_container_width=True,
         )
