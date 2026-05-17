@@ -113,13 +113,84 @@ with st.sidebar:
         ),
     )
 
+    st.subheader("Annualisation policy")
+    normalisation_mode = st.selectbox(
+        "How to extrapolate horizon → year",
+        ["none", "simple", "heating_season", "full_year"],
+        index=1,
+        format_func=lambda m: {
+            "none": "None — show horizon only",
+            "simple": "Simple ×(365 / days) — short horizons OVERSTATE",
+            "heating_season": "Heating-season only (×182 / days)",
+            "full_year": "Full-year (only honest if horizon ≥ 360 d)",
+        }[m],
+        help=(
+            "A 7-day winter run × 52 dramatically overstates annual savings because "
+            "winter weeks carry 3–4× annual-average heating load and 2–3× the price volatility. "
+            "Use 'None' or 'heating_season' for short horizons. Use 'full_year' only when "
+            "you actually have a year of data."
+        ),
+    )
+
     st.markdown("---")
     run_btn = st.button("▶  Run optimisation", type="primary", use_container_width=True)
 
 
 # --------------------------------------------------------------------------
-# Main tabs
+# Annualisation banner — shown wherever €/year figures appear
 # --------------------------------------------------------------------------
+def render_annualisation_banner(prefix: str = "") -> None:
+    """Render the appropriate caveat banner based on the current run's season + mode."""
+    season = st.session_state.get("season")
+    mode = st.session_state.get("normalisation_mode", "simple")
+    if season is None:
+        return
+
+    horizon_days = season.get("horizon_days", 0)
+    label = season.get("season_label", "unknown")
+    spans_full_year = season.get("spans_full_year", False)
+    winter_heavy = season.get("winter_heavy", False)
+    short = season.get("is_short_horizon", False)
+
+    if mode == "none":
+        st.info(
+            f"📏 **Horizon-only view.** All values are for the {horizon_days:.0f}-day "
+            f"{label} period — no annualisation applied."
+        )
+        return
+
+    if spans_full_year:
+        st.success(
+            f"✅ **Full-year horizon** ({horizon_days:.0f} days, {label}). "
+            "Annualised values are validated."
+        )
+        return
+
+    if winter_heavy:
+        st.error(
+            f"⚠️ **Model run: {label}-period annualised scenario, not yet full-year validated.**\n\n"
+            f"This is a {horizon_days:.0f}-day winter-heavy horizon being extrapolated with "
+            f"`{mode}` annualisation. Winter weeks have ~3–4× the annual-average HP load and "
+            f"~2–3× the price volatility, so naive ×52 extrapolation **materially overstates** "
+            f"heat-pump electricity consumption, DA/ID flexibility value, shifted kWh, customer "
+            f"savings, and FlexHeat bonus potential.\n\n"
+            f"**Board-slide wording:** *\"Indicative winter-week annualisation only. "
+            f"Full-year simulation required before treating this as a customer benefit estimate.\"*"
+        )
+    elif short:
+        st.warning(
+            f"⚠️ **Short horizon ({horizon_days:.0f} days, {label} period).** "
+            f"Annualised €/year values assume this window is representative of the full year. "
+            f"Verify with a full-year run before quoting externally."
+        )
+    else:
+        st.warning(
+            f"⚠️ **Partial horizon ({horizon_days:.0f} days, {label}).** "
+            f"Annualised values are extrapolations under `{mode}` mode."
+        )
+
+
+
 st.title("🔥 FlexHeat Optimiser")
 st.caption(
     "Quantify Day-Ahead + Intraday market value, comfort-band flexibility, and DHW shifting "
@@ -291,7 +362,6 @@ with tabs[2]:
 # --------------------------------------------------------------------------
 if run_btn:
     with st.spinner("Loading market data and solving LP for each scenario…"):
-        # Always (re)load market data with current settings if missing
         md = st.session_state["md"]
         if md is None:
             md = dl.load_market_data(
@@ -303,7 +373,6 @@ if run_btn:
             )
             st.session_state["md"] = md
 
-        # Run scenarios
         results = sc.run_all_scenarios(
             arch=arch,
             md=md,
@@ -312,28 +381,55 @@ if run_btn:
             comfort_band_flex=(float(t_min_flex), float(t_max_flex)),
             scenarios=selected_scenarios,
         )
-        kpi_df = sc.kpi_table(results, horizon_days=float(horizon_days))
-        value = sc.value_stack(results, horizon_days=float(horizon_days))
+
+        # Detect season once, reuse everywhere
+        season = sc.detect_season(md.timestamps, md.outdoor_temp_c)
+        # Use season's measured horizon length (more accurate than UI input)
+        horizon_days_eff = float(season["horizon_days"]) or float(horizon_days)
+
+        kpi_df = sc.kpi_table(
+            results,
+            horizon_days=horizon_days_eff,
+            normalisation_mode=normalisation_mode,
+            season=season,
+        )
+        value = sc.value_stack(
+            results,
+            horizon_days=horizon_days_eff,
+            normalisation_mode=normalisation_mode,
+            season=season,
+        )
         interp = sc.build_interpretation(
             results, value,
             customer_share=float(C.PORTFOLIO_DEFAULTS["customer_share"]),
-            horizon_days=float(horizon_days),
+            horizon_days=horizon_days_eff,
+            normalisation_mode=normalisation_mode,
+            season=season,
         )
-        validations = val.run_all_validations(results, arch, float(horizon_days))
+        validations = val.run_all_validations(
+            results, arch, horizon_days_eff,
+            normalisation_mode=normalisation_mode,
+        )
 
         st.session_state["results"] = results
         st.session_state["kpi_df"] = kpi_df
         st.session_state["value"] = value
         st.session_state["interpretation"] = interp
         st.session_state["validations"] = validations
+        st.session_state["season"] = season
+        st.session_state["normalisation_mode"] = normalisation_mode
         st.session_state["run_cfg"] = {
-            "horizon_days": horizon_days,
+            "horizon_days": horizon_days_eff,
             "timestep_h": timestep_h,
             "n_steps": n_steps,
             "comfort_band": (float(t_min), float(t_max)),
             "comfort_band_flex": (float(t_min_flex), float(t_max_flex)),
             "archetype": arch_name,
             "scenarios": selected_scenarios,
+            "normalisation_mode": normalisation_mode,
+            "season_label": season["season_label"],
+            "heating_share": round(season["heating_share"], 3),
+            "annualisation_factor": round(value.get("_annualisation_factor", 1.0), 3),
         }
     st.success(f"Solved {len(results)} scenario(s).")
 
@@ -349,45 +445,85 @@ with tabs[0]:
         kpi_df = st.session_state["kpi_df"]
         value = st.session_state["value"]
         interp = st.session_state["interpretation"]
+        season = st.session_state.get("season", {})
+        mode = st.session_state.get("normalisation_mode", "simple")
 
-        st.subheader("Headline numbers (annualised)")
+        # Caveat banner FIRST — before any €/year number is shown
+        render_annualisation_banner()
+
         if "S0" in kpi_df.scenario.values:
-            baseline_retail = float(
-                kpi_df.loc[kpi_df.scenario == "S0", "retail_cost_eur_year"].iloc[0]
+            baseline_retail_year = float(
+                kpi_df.loc[kpi_df.scenario == "S0", "annualised_retail_cost_eur"].iloc[0]
+            )
+            baseline_retail_horizon = float(
+                kpi_df.loc[kpi_df.scenario == "S0", "horizon_retail_cost_eur"].iloc[0]
             )
         else:
-            baseline_retail = float("nan")
+            baseline_retail_year = baseline_retail_horizon = float("nan")
+
         best_row = (
             kpi_df.loc[kpi_df.scenario != "S0"]
-            .sort_values("wholesale_cost_eur_year").head(1)
+            .sort_values("annualised_wholesale_cost_eur").head(1)
         )
         if not best_row.empty:
             best = best_row.iloc[0]
-            saving_eur = float(best["wholesale_saving_eur_year"])
-            saving_retail = float(best["retail_saving_eur_year"])
+            saving_eur_year = float(best["annualised_wholesale_saving_eur"])
+            saving_retail_year = float(best["annualised_retail_saving_eur"])
+            saving_eur_horizon = float(best["horizon_wholesale_saving_eur"])
+            saving_retail_horizon = float(best["horizon_retail_saving_eur"])
             saving_pct = float(best["saving_pct_retail"])
         else:
             best = None
-            saving_eur = saving_retail = saving_pct = float("nan")
+            saving_eur_year = saving_retail_year = float("nan")
+            saving_eur_horizon = saving_retail_horizon = float("nan")
+            saving_pct = float("nan")
 
+        st.subheader("Headline numbers — horizon vs annualised")
+        st.caption(
+            f"Horizon = {season.get('horizon_days', 0):.0f} days ({season.get('season_label', '?')}). "
+            f"Annualisation mode: `{mode}` (×{value.get('_annualisation_factor', 1.0):.2f})."
+        )
+
+        # Horizon metrics
+        st.markdown("**📏 Horizon values (no extrapolation)**")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(
-            "Baseline retail bill",
-            f"€{baseline_retail:,.0f}/yr" if np.isfinite(baseline_retail) else "—",
+            "Baseline retail (horizon)",
+            f"€{baseline_retail_horizon:,.0f}" if np.isfinite(baseline_retail_horizon) else "—",
         )
         m2.metric(
-            "Best-case retail saving",
-            f"€{saving_retail:,.0f}/yr" if np.isfinite(saving_retail) else "—",
+            "Best retail saving (horizon)",
+            f"€{saving_retail_horizon:,.0f}" if np.isfinite(saving_retail_horizon) else "—",
             delta=f"−{saving_pct:.1f}%" if np.isfinite(saving_pct) else None,
         )
         m3.metric(
-            "Wholesale value (E.ON view)",
-            f"€{saving_eur:,.0f}/yr" if np.isfinite(saving_eur) else "—",
+            "Wholesale value (horizon)",
+            f"€{saving_eur_horizon:,.0f}" if np.isfinite(saving_eur_horizon) else "—",
         )
         m4.metric(
             "Best scenario",
             best["scenario"] if best is not None else "—",
             help=best["label"] if best is not None else None,
+        )
+
+        # Annualised metrics
+        st.markdown(
+            "**📆 Annualised values** &nbsp;"
+            f"<span style='color: #888;'>({mode} mode, factor ×{value.get('_annualisation_factor', 1.0):.2f})</span>",
+            unsafe_allow_html=True,
+        )
+        m1, m2, m3, _ = st.columns(4)
+        m1.metric(
+            "Baseline retail bill",
+            f"€{baseline_retail_year:,.0f}/yr" if np.isfinite(baseline_retail_year) else "—",
+        )
+        m2.metric(
+            "Retail saving",
+            f"€{saving_retail_year:,.0f}/yr" if np.isfinite(saving_retail_year) else "—",
+        )
+        m3.metric(
+            "Wholesale value (E.ON view)",
+            f"€{saving_eur_year:,.0f}/yr" if np.isfinite(saving_eur_year) else "—",
         )
 
         st.markdown("### Interpretation")
@@ -410,23 +546,56 @@ with tabs[3]:
     if results is None:
         st.info("Run an optimisation to see results.")
     else:
+        render_annualisation_banner()
+
         st.markdown("#### KPI table — per scenario")
-        display = kpi_df.copy()
-        currency_cols = [c for c in display.columns if "eur" in c]
-        for c in currency_cols:
-            display[c] = display[c].map(lambda x: f"€{x:,.0f}" if np.isfinite(x) else "—")
-        for c in ["scop", "avg_cop_sh", "avg_cop_dhw"]:
-            display[c] = display[c].map(lambda x: f"{x:.2f}" if np.isfinite(x) else "—")
-        for c in ["saving_pct_retail", "shifted_share_pct"]:
-            display[c] = display[c].map(lambda x: f"{x:.1f}%" if np.isfinite(x) else "—")
+        kpi_view = st.radio(
+            "Show",
+            ["Horizon values only", "Annualised values only", "Both (full table)"],
+            horizontal=True,
+            index=2,
+            key="kpi_view_mode",
+        )
+        # Pick columns
+        horizon_cols = [c for c in kpi_df.columns if c.startswith("horizon_")]
+        annual_cols = [c for c in kpi_df.columns if c.startswith("annualised_")]
+        ratio_cols = [
+            "scenario", "label", "saving_pct_retail", "shifted_share_pct",
+            "scop", "avg_cop_sh", "avg_cop_dhw",
+            "comfort_violation_hours", "dhw_violation_hours",
+            "status", "normalisation_mode", "season_label",
+        ]
+        if kpi_view == "Horizon values only":
+            cols = ["scenario", "label"] + horizon_cols + [
+                "scop", "comfort_violation_hours", "status", "season_label"
+            ]
+        elif kpi_view == "Annualised values only":
+            cols = ["scenario", "label"] + annual_cols + [
+                "saving_pct_retail", "scop", "normalisation_mode", "annualisation_factor",
+            ]
+        else:
+            cols = list(kpi_df.columns)
+        display = kpi_df[cols].copy()
+        for c in display.columns:
+            if "eur" in c:
+                display[c] = display[c].map(lambda x: f"€{x:,.0f}" if isinstance(x, (int, float)) and np.isfinite(x) else x)
+            elif c in ("scop", "avg_cop_sh", "avg_cop_dhw", "annualisation_factor"):
+                display[c] = display[c].map(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) and np.isfinite(x) else x)
+            elif c in ("saving_pct_retail", "shifted_share_pct"):
+                display[c] = display[c].map(lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) and np.isfinite(x) else x)
         st.dataframe(display, use_container_width=True, hide_index=True)
 
         st.markdown("#### Heat-pump electrical load — all scenarios")
         st.plotly_chart(pl.plot_hp_load(results), use_container_width=True, key="opt_hp_load")
 
         st.markdown("#### Cost comparison")
-        mode = st.radio("View costs as", ["wholesale", "retail"], horizontal=True, index=0)
-        st.plotly_chart(pl.plot_cost_bars(kpi_df, mode=mode), use_container_width=True, key="opt_cost_bars")
+        cost_mode = st.radio(
+            "View costs as", ["wholesale", "retail"], horizontal=True, index=0, key="cost_mode"
+        )
+        st.plotly_chart(
+            pl.plot_cost_bars(kpi_df, mode=cost_mode),
+            use_container_width=True, key="opt_cost_bars",
+        )
 
         with st.expander("Settlement breakdown (DA vs ID cost components)"):
             settle = kpi_df[["scenario", "label", "da_cost_eur", "id_adjustment_cost_eur"]].copy()
@@ -524,23 +693,47 @@ with tabs[5]:
     if results is None:
         st.info("Run an optimisation to see value decomposition.")
     else:
+        render_annualisation_banner()
+
         st.plotly_chart(pl.plot_value_stack(value), use_container_width=True, key="mv_value_stack")
 
-        st.markdown("#### Value table (annualised €)")
-        vdf = pd.DataFrame(
-            [{"component": k, "eur_per_year": v} for k, v in value.items()]
-        )
-        vdf["eur_per_year"] = vdf["eur_per_year"].map(lambda x: f"€{x:,.0f}")
-        st.dataframe(vdf, use_container_width=True, hide_index=True)
+        st.markdown("#### Value table — horizon vs annualised")
+        # Separate metadata keys (prefixed _) from real value entries
+        rows = []
+        for k, v in value.items():
+            if k.startswith("_"):
+                continue
+            kind = "horizon" if k.endswith("_horizon") else "annualised"
+            base_name = k.replace("_eur_horizon", "").replace("_eur_year", "")
+            rows.append({"component": base_name, "kind": kind, "eur": v})
+        vdf = pd.DataFrame(rows)
+        if not vdf.empty:
+            vdf_pivot = vdf.pivot_table(
+                index="component", columns="kind", values="eur", aggfunc="first"
+            ).reset_index()
+            for c in vdf_pivot.columns:
+                if c != "component":
+                    vdf_pivot[c] = vdf_pivot[c].map(
+                        lambda x: f"€{x:,.0f}" if isinstance(x, (int, float)) and np.isfinite(x) else "—"
+                    )
+            st.dataframe(vdf_pivot, use_container_width=True, hide_index=True)
 
-        st.markdown("#### Cost components per scenario (€/year)")
+        st.markdown("#### Cost components per scenario")
         cost_view = kpi_df[[
-            "scenario", "label", "wholesale_cost_eur_year",
-            "retail_cost_eur_year", "wholesale_saving_eur_year", "retail_saving_eur_year",
+            "scenario", "label",
+            "horizon_wholesale_cost_eur", "annualised_wholesale_cost_eur",
+            "horizon_retail_cost_eur", "annualised_retail_cost_eur",
+            "horizon_wholesale_saving_eur", "annualised_wholesale_saving_eur",
         ]].copy()
+        cost_view.columns = [
+            "scenario", "label",
+            "wholesale_horizon", "wholesale_year",
+            "retail_horizon", "retail_year",
+            "wholesale_saving_horizon", "wholesale_saving_year",
+        ]
         for c in cost_view.columns:
-            if "eur" in c:
-                cost_view[c] = cost_view[c].map(lambda x: f"€{x:,.0f}")
+            if c not in ("scenario", "label"):
+                cost_view[c] = cost_view[c].map(lambda x: f"€{x:,.0f}" if np.isfinite(x) else "—")
         st.dataframe(cost_view, use_container_width=True, hide_index=True)
 
         st.caption(
@@ -679,8 +872,65 @@ with tabs[8]:
             validations = st.session_state.get("validations") or {}
             value = st.session_state.get("value") or {}
             interp = st.session_state.get("interpretation") or ""
+            season = st.session_state.get("season") or {}
+            mode = st.session_state.get("normalisation_mode", "simple")
 
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+            # ---- CAVEAT banner — assembled first so it goes at the top ----
+            horizon_d = season.get("horizon_days", 0)
+            label = season.get("season_label", "unknown")
+            spans = season.get("spans_full_year", False)
+            winter_heavy = season.get("winter_heavy", False)
+            short = season.get("is_short_horizon", False)
+            factor = value.get("_annualisation_factor", 1.0)
+
+            if mode == "none":
+                caveat_html = (
+                    f"<div class='caveat-info'>"
+                    f"<strong>📏 Horizon-only view.</strong> All values are for the "
+                    f"{horizon_d:.0f}-day {label} period; no annualisation applied."
+                    f"</div>"
+                )
+            elif spans:
+                caveat_html = (
+                    f"<div class='caveat-ok'>"
+                    f"<strong>✅ Full-year horizon</strong> ({horizon_d:.0f} days). "
+                    f"Annualised values are validated."
+                    f"</div>"
+                )
+            elif winter_heavy:
+                caveat_html = (
+                    f"<div class='caveat-error'>"
+                    f"<strong>⚠️ Model run: {label}-period annualised scenario, "
+                    f"not yet full-year validated.</strong><br><br>"
+                    f"This is a {horizon_d:.0f}-day winter-heavy horizon extrapolated with "
+                    f"<code>{mode}</code> annualisation (×{factor:.2f}). Winter weeks have "
+                    f"~3–4× annual-average HP load and ~2–3× the price volatility, so naive "
+                    f"extrapolation <strong>materially overstates</strong> heat-pump electricity "
+                    f"consumption, DA/ID flexibility value, shifted kWh, customer savings, and "
+                    f"FlexHeat bonus potential.<br><br>"
+                    f"<strong>Recommended board-slide wording:</strong> "
+                    f"<em>\"Indicative winter-week annualisation only. Full-year simulation "
+                    f"required before treating this as a customer benefit estimate.\"</em>"
+                    f"</div>"
+                )
+            elif short:
+                caveat_html = (
+                    f"<div class='caveat-warn'>"
+                    f"<strong>⚠️ Short horizon ({horizon_d:.0f} days, {label} period).</strong> "
+                    f"Annualised €/year values assume this window is representative. "
+                    f"Run a full year of data before quoting externally."
+                    f"</div>"
+                )
+            else:
+                caveat_html = (
+                    f"<div class='caveat-warn'>"
+                    f"<strong>⚠️ Partial horizon ({horizon_d:.0f} days, {label}).</strong> "
+                    f"Annualised values are extrapolations under <code>{mode}</code> mode "
+                    f"(×{factor:.2f})."
+                    f"</div>"
+                )
 
             # ---- Section 1: Run summary
             cfg_rows = "".join(
@@ -693,15 +943,27 @@ with tabs[8]:
                     for k, v in arch_obj.to_dict().items()
                 )
 
-            # ---- Section 2: KPI table
-            kpi_html = kpi_df.to_html(
-                index=False, float_format=lambda x: f"{x:,.2f}", classes="kpi"
-            )
+            # ---- Section 2: KPI table (drop pure-display columns)
+            kpi_html_df = kpi_df.copy()
+            for c in kpi_html_df.columns:
+                if "eur" in c:
+                    kpi_html_df[c] = kpi_html_df[c].map(
+                        lambda x: f"€{x:,.0f}" if isinstance(x, (int, float)) and np.isfinite(x) else x
+                    )
+            kpi_html = kpi_html_df.to_html(index=False, classes="kpi", escape=False)
 
-            # ---- Section 3: Value stack
-            value_rows = "".join(
-                f"<tr><th>{k.replace('_', ' ')}</th><td>€{v:,.0f}/yr</td></tr>"
+            # ---- Section 3: Value stack — both horizon and annualised
+            value_rows_h = "".join(
+                f"<tr><th>{k.replace('_eur_horizon', '').replace('_', ' ')}</th>"
+                f"<td>€{v:,.0f}</td></tr>"
                 for k, v in value.items()
+                if k.endswith("_horizon") and not k.startswith("_")
+            )
+            value_rows_a = "".join(
+                f"<tr><th>{k.replace('_eur_year', '').replace('_', ' ')}</th>"
+                f"<td>€{v:,.0f}/yr</td></tr>"
+                for k, v in value.items()
+                if k.endswith("_eur_year") and not k.startswith("_")
             )
 
             # ---- Section 4: Validation findings
@@ -763,12 +1025,18 @@ with tabs[8]:
   .lvl-error {{ color: #c62828; font-weight: 600; }}
   code {{ background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 0.85em; }}
   .interp {{ background: #fff3e0; border-left: 4px solid #ff6900; padding: 1em; }}
+  .caveat-error {{ background: #ffebee; border-left: 5px solid #c62828; padding: 1em; margin: 1em 0; }}
+  .caveat-warn {{ background: #fff3e0; border-left: 5px solid #ef6c00; padding: 1em; margin: 1em 0; }}
+  .caveat-info {{ background: #e3f2fd; border-left: 5px solid #1565c0; padding: 1em; margin: 1em 0; }}
+  .caveat-ok {{ background: #e8f5e9; border-left: 5px solid #2e7d32; padding: 1em; margin: 1em 0; }}
   footer {{ margin-top: 3em; color: #888; font-size: 0.85em; }}
 </style>
 </head>
 <body>
 <h1>🔥 FlexHeat Optimiser — Results Report</h1>
 <p><strong>Generated:</strong> {now}</p>
+
+{caveat_html}
 
 <h2>1. Executive interpretation</h2>
 <div class="interp">{interp.replace(chr(10), "<br>") if interp else "No interpretation available."}</div>
@@ -782,8 +1050,11 @@ with tabs[8]:
 <h2>4. KPI table — all scenarios</h2>
 {kpi_html}
 
-<h2>5. Annualised value stack (€/year)</h2>
-<table><tbody>{value_rows}</tbody></table>
+<h2>5. Value stack — horizon and annualised</h2>
+<h3>Horizon values (no extrapolation)</h3>
+<table><tbody>{value_rows_h or '<tr><td colspan="2">No horizon-only values to display.</td></tr>'}</tbody></table>
+<h3>Annualised values (apply caveats above)</h3>
+<table><tbody>{value_rows_a or '<tr><td colspan="2">No annualised values to display.</td></tr>'}</tbody></table>
 
 <h2>6. Validation findings</h2>
 {valid_html}
