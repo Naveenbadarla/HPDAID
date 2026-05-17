@@ -148,27 +148,33 @@ with tabs[1]:
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("**Building**")
-        floor_area = st.number_input("Floor area (m²)", 30.0, 500.0, base.floor_area_m2, 5.0)
+        floor_area = st.number_input(
+            "Floor area (m²)", 30.0, 500.0, float(base.floor_area_m2), 5.0
+        )
         annual_heat = st.number_input(
-            "Annual SH demand (kWh)", 1_000.0, 50_000.0, base.annual_heat_demand_kwh, 100.0
+            "Annual SH demand (kWh)", 1_000.0, 50_000.0,
+            float(base.annual_heat_demand_kwh), 100.0,
         )
         annual_dhw = st.number_input(
-            "Annual DHW demand (kWh)", 500.0, 8_000.0, base.annual_dhw_demand_kwh, 50.0
+            "Annual DHW demand (kWh)", 500.0, 8_000.0,
+            float(base.annual_dhw_demand_kwh), 50.0,
         )
         ua = st.number_input(
-            "UA value (kW/K)", 0.05, 1.0, base.ua_kw_per_k, 0.01, format="%.3f"
+            "UA value (kW/K)", 0.05, 1.0, float(base.ua_kw_per_k), 0.01, format="%.3f"
         )
         c_th = st.number_input(
-            "Thermal capacitance (kWh/K)", 5.0, 100.0, base.c_th_kwh_per_k, 1.0
+            "Thermal capacitance (kWh/K)", 5.0, 100.0, float(base.c_th_kwh_per_k), 1.0
         )
     with col2:
         st.markdown("**Heat pump**")
-        hp_thermal = st.number_input("HP thermal capacity (kW)", 2.0, 30.0, base.hp_thermal_kw, 0.5)
+        hp_thermal = st.number_input(
+            "HP thermal capacity (kW)", 2.0, 30.0, float(base.hp_thermal_kw), 0.5
+        )
         hp_elec = st.number_input(
-            "HP electrical capacity (kW)", 1.0, 15.0, base.hp_electrical_kw, 0.5
+            "HP electrical capacity (kW)", 1.0, 15.0, float(base.hp_electrical_kw), 0.5
         )
         hp_min_mod = st.number_input(
-            "Min modulation (0-1)", 0.0, 1.0, base.hp_min_modulation, 0.05
+            "Min modulation (0-1)", 0.0, 1.0, float(base.hp_min_modulation), 0.05
         )
         emitter = st.selectbox(
             "Emitter type", ["underfloor", "radiator"],
@@ -176,31 +182,35 @@ with tabs[1]:
         )
     with col3:
         st.markdown("**DHW tank**")
-        dhw_kwh = st.number_input("Tank usable energy (kWh)", 2.0, 30.0, base.dhw_tank_kwh, 0.5)
+        dhw_kwh = st.number_input(
+            "Tank usable energy (kWh)", 2.0, 30.0, float(base.dhw_tank_kwh), 0.5
+        )
         dhw_loss = st.number_input(
-            "Standing loss (kWh/step)", 0.0, 0.5, base.dhw_tank_loss_kwh_per_step, 0.005,
-            format="%.4f",
+            "Standing loss (kWh/step)", 0.0, 0.5,
+            float(base.dhw_tank_loss_kwh_per_step), 0.005, format="%.4f",
         )
         st.markdown("**Comfort defaults**")
-        t_target = st.number_input("Target T_in (°C)", 18.0, 24.0, base.t_target, 0.5)
+        t_target = st.number_input(
+            "Target T_in (°C)", 18.0, 24.0, float(base.t_target), 0.5
+        )
 
     arch = A.Archetype(
         name=base.name + ("_custom" if base.name == "custom" else ""),
         label=base.label,
-        floor_area_m2=floor_area,
-        annual_heat_demand_kwh=annual_heat,
-        annual_dhw_demand_kwh=annual_dhw,
-        ua_kw_per_k=ua,
-        c_th_kwh_per_k=c_th,
-        hp_thermal_kw=hp_thermal,
-        hp_electrical_kw=hp_elec,
-        hp_min_modulation=hp_min_mod,
+        floor_area_m2=float(floor_area),
+        annual_heat_demand_kwh=float(annual_heat),
+        annual_dhw_demand_kwh=float(annual_dhw),
+        ua_kw_per_k=float(ua),
+        c_th_kwh_per_k=float(c_th),
+        hp_thermal_kw=float(hp_thermal),
+        hp_electrical_kw=float(hp_elec),
+        hp_min_modulation=float(hp_min_mod),
         emitter=emitter,
-        dhw_tank_kwh=dhw_kwh,
-        dhw_tank_loss_kwh_per_step=dhw_loss,
-        t_target=t_target,
-        t_min=t_min,
-        t_max=t_max,
+        dhw_tank_kwh=float(dhw_kwh),
+        dhw_tank_loss_kwh_per_step=float(dhw_loss),
+        t_target=float(t_target),
+        t_min=float(t_min),
+        t_max=float(t_max),
         flexibility_rating=base.flexibility_rating,
     )
     st.session_state["arch"] = arch
@@ -267,7 +277,10 @@ with tabs[2]:
             })
             st.dataframe(preview.head(96), use_container_width=True)
     else:
-        st.info("Click **Load market data** above, or hit **Run optimisation** in the sidebar — synthetic data will be generated automatically.")
+        st.info(
+            "Click **Load market data** above, or hit **Run optimisation** in the sidebar — "
+            "synthetic data will be generated automatically."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -292,18 +305,18 @@ if run_btn:
             arch=arch,
             md=md,
             timestep_h=timestep_h,
-            comfort_band=(t_min, t_max),
-            comfort_band_flex=(t_min_flex, t_max_flex),
+            comfort_band=(float(t_min), float(t_max)),
+            comfort_band_flex=(float(t_min_flex), float(t_max_flex)),
             scenarios=selected_scenarios,
         )
-        kpi_df = sc.kpi_table(results, horizon_days=horizon_days)
-        value = sc.value_stack(results, horizon_days=horizon_days)
+        kpi_df = sc.kpi_table(results, horizon_days=float(horizon_days))
+        value = sc.value_stack(results, horizon_days=float(horizon_days))
         interp = sc.build_interpretation(
             results, value,
-            customer_share=C.PORTFOLIO_DEFAULTS["customer_share"],
-            horizon_days=horizon_days,
+            customer_share=float(C.PORTFOLIO_DEFAULTS["customer_share"]),
+            horizon_days=float(horizon_days),
         )
-        validations = val.run_all_validations(results, arch, horizon_days)
+        validations = val.run_all_validations(results, arch, float(horizon_days))
 
         st.session_state["results"] = results
         st.session_state["kpi_df"] = kpi_df
@@ -314,8 +327,8 @@ if run_btn:
             "horizon_days": horizon_days,
             "timestep_h": timestep_h,
             "n_steps": n_steps,
-            "comfort_band": (t_min, t_max),
-            "comfort_band_flex": (t_min_flex, t_max_flex),
+            "comfort_band": (float(t_min), float(t_max)),
+            "comfort_band_flex": (float(t_min_flex), float(t_max_flex)),
             "archetype": arch_name,
             "scenarios": selected_scenarios,
         }
@@ -335,13 +348,21 @@ with tabs[0]:
         interp = st.session_state["interpretation"]
 
         st.subheader("Headline numbers (annualised)")
-        baseline_retail = float(kpi_df.loc[kpi_df.scenario == "S0", "retail_cost_eur_year"].iloc[0]) if "S0" in kpi_df.scenario.values else float("nan")
-        best_row = kpi_df.loc[kpi_df.scenario != "S0"].sort_values("wholesale_cost_eur_year").head(1)
+        if "S0" in kpi_df.scenario.values:
+            baseline_retail = float(
+                kpi_df.loc[kpi_df.scenario == "S0", "retail_cost_eur_year"].iloc[0]
+            )
+        else:
+            baseline_retail = float("nan")
+        best_row = (
+            kpi_df.loc[kpi_df.scenario != "S0"]
+            .sort_values("wholesale_cost_eur_year").head(1)
+        )
         if not best_row.empty:
             best = best_row.iloc[0]
-            saving_eur = best["wholesale_saving_eur_year"]
-            saving_retail = best["retail_saving_eur_year"]
-            saving_pct = best["saving_pct_retail"]
+            saving_eur = float(best["wholesale_saving_eur_year"])
+            saving_retail = float(best["retail_saving_eur_year"])
+            saving_pct = float(best["saving_pct_retail"])
         else:
             best = None
             saving_eur = saving_retail = saving_pct = float("nan")
@@ -432,7 +453,7 @@ with tabs[4]:
             default=list(results.keys()),
             key="temp_scen",
         )
-        comfort = (t_min, t_max)
+        comfort = (float(t_min), float(t_max))
         if scen_for_temp:
             sub = {k: results[k] for k in scen_for_temp}
             st.plotly_chart(
@@ -443,16 +464,16 @@ with tabs[4]:
         st.markdown("#### DHW tank state of charge")
         if scen_for_temp:
             st.plotly_chart(
-                pl.plot_dhw_tank({k: results[k] for k in scen_for_temp}, arch.dhw_tank_kwh),
+                pl.plot_dhw_tank({k: results[k] for k in scen_for_temp}, float(arch.dhw_tank_kwh)),
                 use_container_width=True,
             )
 
         st.markdown("#### Single-day dispatch view")
         day_choice = st.selectbox(
-            "Day to inspect", list(range(1, horizon_days + 1)), index=0, key="day_pick"
+            "Day to inspect", list(range(1, int(horizon_days) + 1)), index=0, key="day_pick"
         )
         steps_per_day = int(round(24 / timestep_h))
-        i0 = (day_choice - 1) * steps_per_day
+        i0 = (int(day_choice) - 1) * steps_per_day
         i1 = i0 + steps_per_day
         scen_for_dispatch = st.selectbox(
             "Scenario", list(results.keys()),
@@ -545,8 +566,8 @@ with tabs[6]:
 
             fp = fl.FleetParams(
                 n_households=int(n_house),
-                adoption_rate=adoption,
-                customer_share=cust_share,
+                adoption_rate=float(adoption),
+                customer_share=float(cust_share),
             )
             summary = fl.scale_results(val_per_hh, elec_per_hh, arch, fp)
             st.session_state["fleet_summary"] = summary
@@ -563,8 +584,8 @@ with tabs[6]:
             st.markdown("#### Value vs. portfolio size")
             scaling_df = fl.scaling_curve(
                 value_per_household_eur=val_per_hh,
-                arch_hp_electrical_kw=arch.hp_electrical_kw,
-                customer_share=cust_share,
+                arch_hp_electrical_kw=float(arch.hp_electrical_kw),
+                customer_share=float(cust_share),
             )
             st.session_state["scaling_df"] = scaling_df
             st.plotly_chart(pl.plot_fleet_scaling(scaling_df), use_container_width=True)
@@ -592,7 +613,10 @@ with tabs[7]:
         c4.metric("❌ Errors", n_err)
 
         for key, findings in validations.items():
-            with st.expander(f"{key} — {len(findings)} finding(s)", expanded=(n_err > 0 and key != "business")):
+            with st.expander(
+                f"{key} — {len(findings)} finding(s)",
+                expanded=(n_err > 0 and key != "business"),
+            ):
                 for f in findings:
                     label = f"`{f.code}` · {f.message}"
                     if f.level == "error":
