@@ -54,8 +54,8 @@ T_MAX_FLEX: float = 22.5
 
 # Comfort violation penalty is intentionally high so that the optimiser
 # does NOT use comfort slack as a cheap way to lower cost.
-COMFORT_PENALTY_EUR_PER_KWH_DEG: float = 5.0
-DHW_PENALTY_EUR_PER_KWH: float = 2.0
+COMFORT_PENALTY_EUR_PER_KWH_DEG: float = 100.0   # €/(K·step) at 15-min; scaled by timestep
+DHW_PENALTY_EUR_PER_KWH: float = 50.0            # €/(kWh·step) at 15-min; scaled by timestep
 
 
 # --------------------------------------------------------------------------
