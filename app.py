@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import io
 import json
+import zipfile
+from datetime import datetime
 from dataclasses import asdict
 from typing import Dict, List
 
@@ -663,12 +665,318 @@ with tabs[8]:
     if results is None:
         st.info("Run an optimisation first.")
     else:
+        st.markdown(
+            "Download a single comprehensive report bundle covering every scenario, "
+            "or grab individual files below."
+        )
+
+        # ------------------------------------------------------------------
+        # Helper: build a self-contained HTML report
+        # ------------------------------------------------------------------
+        def _build_html_report() -> str:
+            run_cfg = st.session_state.get("run_cfg") or {}
+            arch_obj = st.session_state.get("arch")
+            validations = st.session_state.get("validations") or {}
+            value = st.session_state.get("value") or {}
+            interp = st.session_state.get("interpretation") or ""
+
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+            # ---- Section 1: Run summary
+            cfg_rows = "".join(
+                f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in run_cfg.items()
+            )
+            arch_rows = ""
+            if arch_obj is not None:
+                arch_rows = "".join(
+                    f"<tr><th>{k}</th><td>{v}</td></tr>"
+                    for k, v in arch_obj.to_dict().items()
+                )
+
+            # ---- Section 2: KPI table
+            kpi_html = kpi_df.to_html(
+                index=False, float_format=lambda x: f"{x:,.2f}", classes="kpi"
+            )
+
+            # ---- Section 3: Value stack
+            value_rows = "".join(
+                f"<tr><th>{k.replace('_', ' ')}</th><td>€{v:,.0f}/yr</td></tr>"
+                for k, v in value.items()
+            )
+
+            # ---- Section 4: Validation findings
+            valid_html_parts = []
+            for key, findings in validations.items():
+                rows = "".join(
+                    f'<tr><td class="lvl-{f.level}">{f.level.upper()}</td>'
+                    f'<td><code>{f.code}</code></td><td>{f.message}</td></tr>'
+                    for f in findings
+                )
+                if rows:
+                    valid_html_parts.append(
+                        f"<h3>{key}</h3>"
+                        f"<table class='findings'><thead><tr>"
+                        f"<th>Level</th><th>Code</th><th>Message</th>"
+                        f"</tr></thead><tbody>{rows}</tbody></table>"
+                    )
+            valid_html = "".join(valid_html_parts) if valid_html_parts else "<p>No findings.</p>"
+
+            # ---- Section 5: Per-scenario time series (first 96 rows preview)
+            preview_html_parts = []
+            for k, r in results.items():
+                df = pd.DataFrame({
+                    "timestamp": r.timestamps[:96],
+                    "t_in_c": r.t_in_c[:96],
+                    "elec_kwh": r.elec_kwh[:96],
+                    "q_sh_kwh": r.q_sh_kwh[:96],
+                    "q_dhw_kwh": r.q_dhw_kwh[:96],
+                    "e_dhw_kwh": r.e_dhw_kwh[:96],
+                    "cop_sh": r.cop_sh[:96],
+                    "da_volume_kwh": r.da_volume_kwh[:96],
+                    "id_adjustment_kwh": r.id_adjustment_kwh[:96],
+                })
+                preview_html_parts.append(
+                    f"<h3>{k} — {r.label}</h3>"
+                    f"<p><em>First 96 steps (one day at 15-min). Full series in the CSV/Excel exports.</em></p>"
+                    + df.to_html(index=False, float_format=lambda x: f"{x:.3f}")
+                )
+
+            # ---- Assemble
+            html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>FlexHeat Optimiser — Report</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+         max-width: 1100px; margin: 2em auto; padding: 0 1em; color: #222; line-height: 1.5; }}
+  h1 {{ border-bottom: 3px solid #ff6900; padding-bottom: 0.3em; }}
+  h2 {{ color: #ff6900; margin-top: 2em; border-bottom: 1px solid #ddd; padding-bottom: 0.2em; }}
+  h3 {{ margin-top: 1.5em; }}
+  table {{ border-collapse: collapse; margin: 1em 0; width: 100%; font-size: 0.9em; }}
+  th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; vertical-align: top; }}
+  th {{ background: #f5f5f5; font-weight: 600; }}
+  .kpi tbody tr:nth-child(odd) {{ background: #fafafa; }}
+  .lvl-ok {{ color: #2e7d32; font-weight: 600; }}
+  .lvl-info {{ color: #1565c0; font-weight: 600; }}
+  .lvl-warning {{ color: #ef6c00; font-weight: 600; }}
+  .lvl-error {{ color: #c62828; font-weight: 600; }}
+  code {{ background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 0.85em; }}
+  .interp {{ background: #fff3e0; border-left: 4px solid #ff6900; padding: 1em; }}
+  footer {{ margin-top: 3em; color: #888; font-size: 0.85em; }}
+</style>
+</head>
+<body>
+<h1>🔥 FlexHeat Optimiser — Results Report</h1>
+<p><strong>Generated:</strong> {now}</p>
+
+<h2>1. Executive interpretation</h2>
+<div class="interp">{interp.replace(chr(10), "<br>") if interp else "No interpretation available."}</div>
+
+<h2>2. Run configuration</h2>
+<table><tbody>{cfg_rows}</tbody></table>
+
+<h2>3. Archetype parameters</h2>
+<table><tbody>{arch_rows}</tbody></table>
+
+<h2>4. KPI table — all scenarios</h2>
+{kpi_html}
+
+<h2>5. Annualised value stack (€/year)</h2>
+<table><tbody>{value_rows}</tbody></table>
+
+<h2>6. Validation findings</h2>
+{valid_html}
+
+<h2>7. Per-scenario time series (preview)</h2>
+{"".join(preview_html_parts)}
+
+<footer>
+FlexHeat Optimiser — prototype model. Wholesale prices in €/MWh; energies in kWh per time step;
+temperatures in °C. Synthetic-data runs are illustrative only.
+</footer>
+</body>
+</html>"""
+            return html
+
+        # ------------------------------------------------------------------
+        # Helper: build a multi-sheet Excel workbook
+        # ------------------------------------------------------------------
+        def _build_excel_bundle() -> bytes:
+            buf = io.BytesIO()
+            try:
+                writer = pd.ExcelWriter(buf, engine="openpyxl")
+            except ModuleNotFoundError:
+                # Fallback: use xlsxwriter if openpyxl is missing
+                writer = pd.ExcelWriter(buf, engine="xlsxwriter")
+
+            with writer:
+                # KPI sheet
+                kpi_df.to_excel(writer, sheet_name="KPI", index=False)
+
+                # Value stack sheet
+                value = st.session_state.get("value") or {}
+                pd.DataFrame(
+                    [{"component": k, "eur_per_year": v} for k, v in value.items()]
+                ).to_excel(writer, sheet_name="Value_stack", index=False)
+
+                # Run config sheet
+                run_cfg = st.session_state.get("run_cfg") or {}
+                pd.DataFrame(
+                    [{"key": k, "value": str(v)} for k, v in run_cfg.items()]
+                ).to_excel(writer, sheet_name="Run_config", index=False)
+
+                # Archetype sheet
+                arch_obj = st.session_state.get("arch")
+                if arch_obj is not None:
+                    pd.DataFrame(
+                        [{"key": k, "value": v} for k, v in arch_obj.to_dict().items()]
+                    ).to_excel(writer, sheet_name="Archetype", index=False)
+
+                # Validation sheet
+                validations = st.session_state.get("validations") or {}
+                vrows = []
+                for category, findings in validations.items():
+                    for f in findings:
+                        vrows.append({
+                            "category": category, "level": f.level,
+                            "code": f.code, "message": f.message,
+                        })
+                if vrows:
+                    pd.DataFrame(vrows).to_excel(writer, sheet_name="Validation", index=False)
+
+                # One sheet per scenario time series
+                for k, r in results.items():
+                    df = pd.DataFrame({
+                        "timestamp": r.timestamps,
+                        "t_in_c": r.t_in_c,
+                        "q_sh_kwh": r.q_sh_kwh,
+                        "q_dhw_kwh": r.q_dhw_kwh,
+                        "e_dhw_kwh": r.e_dhw_kwh,
+                        "elec_kwh": r.elec_kwh,
+                        "elec_sh_kwh": r.elec_sh_kwh,
+                        "elec_dhw_kwh": r.elec_dhw_kwh,
+                        "cop_sh": r.cop_sh,
+                        "cop_dhw": r.cop_dhw,
+                        "da_volume_kwh": r.da_volume_kwh,
+                        "id_volume_kwh": r.id_volume_kwh,
+                        "id_adjustment_kwh": r.id_adjustment_kwh,
+                    })
+                    df.to_excel(writer, sheet_name=f"TS_{k}", index=False)
+
+            return buf.getvalue()
+
+        # ------------------------------------------------------------------
+        # Helper: build a ZIP of all CSVs
+        # ------------------------------------------------------------------
+        def _build_csv_zip() -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                # KPI
+                zf.writestr("kpi_table.csv", kpi_df.to_csv(index=False))
+
+                # Value stack
+                value = st.session_state.get("value") or {}
+                vdf = pd.DataFrame(
+                    [{"component": k, "eur_per_year": v} for k, v in value.items()]
+                )
+                zf.writestr("value_stack.csv", vdf.to_csv(index=False))
+
+                # Run config
+                run_cfg = st.session_state.get("run_cfg") or {}
+                zf.writestr("run_config.json", json.dumps(run_cfg, default=str, indent=2))
+
+                # Archetype
+                arch_obj = st.session_state.get("arch")
+                if arch_obj is not None:
+                    zf.writestr(
+                        "archetype.json",
+                        json.dumps(arch_obj.to_dict(), default=str, indent=2),
+                    )
+
+                # Validation
+                validations = st.session_state.get("validations") or {}
+                vrows = []
+                for category, findings in validations.items():
+                    for f in findings:
+                        vrows.append({
+                            "category": category, "level": f.level,
+                            "code": f.code, "message": f.message,
+                        })
+                if vrows:
+                    zf.writestr("validation.csv", pd.DataFrame(vrows).to_csv(index=False))
+
+                # Per-scenario time series
+                for k, r in results.items():
+                    df = pd.DataFrame({
+                        "timestamp": r.timestamps,
+                        "t_in_c": r.t_in_c,
+                        "q_sh_kwh": r.q_sh_kwh,
+                        "q_dhw_kwh": r.q_dhw_kwh,
+                        "e_dhw_kwh": r.e_dhw_kwh,
+                        "elec_kwh": r.elec_kwh,
+                        "elec_sh_kwh": r.elec_sh_kwh,
+                        "elec_dhw_kwh": r.elec_dhw_kwh,
+                        "cop_sh": r.cop_sh,
+                        "cop_dhw": r.cop_dhw,
+                        "da_volume_kwh": r.da_volume_kwh,
+                        "id_volume_kwh": r.id_volume_kwh,
+                        "id_adjustment_kwh": r.id_adjustment_kwh,
+                    })
+                    zf.writestr(f"timeseries_{k}.csv", df.to_csv(index=False))
+
+                # HTML report inside the zip too
+                zf.writestr("report.html", _build_html_report())
+
+            return buf.getvalue()
+
+        # ------------------------------------------------------------------
+        # Render the three bundled download buttons up top
+        # ------------------------------------------------------------------
+        st.subheader("📦 Full report bundles")
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button(
+                "📄 HTML report (open in browser)",
+                data=_build_html_report().encode("utf-8"),
+                file_name=f"flexheat_report_{stamp}.html",
+                mime="text/html",
+                use_container_width=True,
+                key="dl_html_report",
+            )
+            st.caption("Single self-contained HTML file — opens in any browser, no software needed.")
+        with c2:
+            st.download_button(
+                "📊 Excel workbook (.xlsx)",
+                data=_build_excel_bundle(),
+                file_name=f"flexheat_report_{stamp}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_xlsx",
+            )
+            st.caption("Multi-sheet workbook: KPIs, value stack, validation, every scenario.")
+        with c3:
+            st.download_button(
+                "🗜️ Full ZIP (CSVs + HTML)",
+                data=_build_csv_zip(),
+                file_name=f"flexheat_report_{stamp}.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="dl_zip",
+            )
+            st.caption("Everything packaged: CSVs for each scenario plus the HTML report.")
+
+        st.markdown("---")
+        st.subheader("Individual files")
+
         st.markdown("#### KPI table")
         st.download_button(
             "Download KPI CSV",
             data=kpi_df.to_csv(index=False).encode("utf-8"),
             file_name="flexheat_kpi.csv",
             mime="text/csv",
+            key="dl_kpi_single",
         )
 
         st.markdown("#### Per-scenario time series")
@@ -702,6 +1010,7 @@ with tabs[8]:
             data=json.dumps(st.session_state["run_cfg"], default=str, indent=2),
             file_name="flexheat_run_config.json",
             mime="application/json",
+            key="dl_runcfg",
         )
 
         st.markdown("---")
