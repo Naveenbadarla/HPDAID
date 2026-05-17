@@ -265,6 +265,7 @@ with tabs[2]:
         st.plotly_chart(
             pl.plot_prices(md.timestamps, md.da_price_eur_mwh, md.id_price_eur_mwh),
             use_container_width=True,
+            key="md_prices",
         )
 
         with st.expander("Preview market data table"):
@@ -391,10 +392,10 @@ with tabs[0]:
         st.markdown(interp)
 
         st.markdown("### Value waterfall — baseline to optimised")
-        st.plotly_chart(pl.plot_waterfall(kpi_df, value), use_container_width=True)
+        st.plotly_chart(pl.plot_waterfall(kpi_df, value), use_container_width=True, key="exec_waterfall")
 
         st.markdown("### Value stack — where the savings come from")
-        st.plotly_chart(pl.plot_value_stack(value), use_container_width=True)
+        st.plotly_chart(pl.plot_value_stack(value), use_container_width=True, key="exec_value_stack")
 
 
 # --------------------------------------------------------------------------
@@ -419,11 +420,11 @@ with tabs[3]:
         st.dataframe(display, use_container_width=True, hide_index=True)
 
         st.markdown("#### Heat-pump electrical load — all scenarios")
-        st.plotly_chart(pl.plot_hp_load(results), use_container_width=True)
+        st.plotly_chart(pl.plot_hp_load(results), use_container_width=True, key="opt_hp_load")
 
         st.markdown("#### Cost comparison")
         mode = st.radio("View costs as", ["wholesale", "retail"], horizontal=True, index=0)
-        st.plotly_chart(pl.plot_cost_bars(kpi_df, mode=mode), use_container_width=True)
+        st.plotly_chart(pl.plot_cost_bars(kpi_df, mode=mode), use_container_width=True, key="opt_cost_bars")
 
         with st.expander("Settlement breakdown (DA vs ID cost components)"):
             settle = kpi_df[["scenario", "label", "da_cost_eur", "id_adjustment_cost_eur"]].copy()
@@ -464,6 +465,7 @@ with tabs[4]:
                     focus=list(sub.keys()),
                 ),
                 use_container_width=True,
+                key="th_indoor_t",
             )
 
         st.markdown("#### DHW tank state of charge")
@@ -478,6 +480,7 @@ with tabs[4]:
                     focus=list(scen_for_temp),
                 ),
                 use_container_width=True,
+                key="th_dhw_tank",
             )
 
         st.markdown("#### Single-day dispatch view")
@@ -504,6 +507,7 @@ with tabs[4]:
                 comfort_band=(float(t_min), float(t_max)),
             ),
             use_container_width=True,
+            key="th_daily_dispatch",
         )
 
 
@@ -518,7 +522,7 @@ with tabs[5]:
     if results is None:
         st.info("Run an optimisation to see value decomposition.")
     else:
-        st.plotly_chart(pl.plot_value_stack(value), use_container_width=True)
+        st.plotly_chart(pl.plot_value_stack(value), use_container_width=True, key="mv_value_stack")
 
         st.markdown("#### Value table (annualised €)")
         vdf = pd.DataFrame(
@@ -604,7 +608,7 @@ with tabs[6]:
                 customer_share=float(cust_share),
             )
             st.session_state["scaling_df"] = scaling_df
-            st.plotly_chart(pl.plot_fleet_scaling(scaling_df), use_container_width=True)
+            st.plotly_chart(pl.plot_fleet_scaling(scaling_df), use_container_width=True, key="fleet_scaling")
 
 
 # --------------------------------------------------------------------------
