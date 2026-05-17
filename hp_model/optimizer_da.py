@@ -166,8 +166,13 @@ def optimise(
     var_lb[off["q_dhw"]  : off["q_dhw"]  + n] = 0.0
     var_ub[off["q_dhw"]  : off["q_dhw"]  + n] = q_th_step_max
 
-    var_lb[off["t_in"]   : off["t_in"]   + n + 1] = t_min - 5.0
-    var_ub[off["t_in"]   : off["t_in"]   + n + 1] = t_max + 5.0
+    # Variable upper bound on t_in must be physically permissive — in summer
+    # with internal gains and warm outdoor temperatures the free-running indoor
+    # temperature can legitimately rise to ~30°C. The slacked comfort constraint
+    # (with v_pos penalty) handles the comfort cost; the variable bound only
+    # exists to prevent absurd values. Same logic for e_dhw.
+    var_lb[off["t_in"]   : off["t_in"]   + n + 1] = -10.0    # well below any real indoor temp
+    var_ub[off["t_in"]   : off["t_in"]   + n + 1] =  50.0    # well above any real indoor temp
     var_lb[off["e_dhw"]  : off["e_dhw"]  + n + 1] = 0.0
     var_ub[off["e_dhw"]  : off["e_dhw"]  + n + 1] = bounds_dhw.e_max_kwh + 5.0
 
@@ -181,10 +186,16 @@ def optimise(
     price_kwh = np.asarray(price_eur_per_mwh, dtype=float) / 1000.0
     c[off["q_sh"]   : off["q_sh"]   + n] = price_kwh / cop_sh
     c[off["q_dhw"]  : off["q_dhw"]  + n] = price_kwh / cop_dhw_arr
-    c[off["v_pos"]  : off["v_pos"]  + n] = comfort_penalty
-    c[off["v_neg"]  : off["v_neg"]  + n] = comfort_penalty
-    c[off["d_pos"]  : off["d_pos"]  + n] = dhw_penalty
-    c[off["d_neg"]  : off["d_neg"]  + n] = dhw_penalty
+    # Scale slack penalties by timestep so the integrated K·hour or kWh-hour
+    # cost is invariant across timestep choices (15-min, 30-min, 60-min).
+    # Without this, hourly LPs discover that abandoning comfort is cheaper than
+    # running the HP because the per-step penalty is the same as for 15-min steps.
+    comfort_penalty_step = comfort_penalty * (timestep_h / 0.25)
+    dhw_penalty_step     = dhw_penalty     * (timestep_h / 0.25)
+    c[off["v_pos"]  : off["v_pos"]  + n] = comfort_penalty_step
+    c[off["v_neg"]  : off["v_neg"]  + n] = comfort_penalty_step
+    c[off["d_pos"]  : off["d_pos"]  + n] = dhw_penalty_step
+    c[off["d_neg"]  : off["d_neg"]  + n] = dhw_penalty_step
 
     # ---------- Equality constraints ----------
     n_eq = 2 + 2 * n
